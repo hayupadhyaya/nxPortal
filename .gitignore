@@ -1,0 +1,16 @@
+.DS_Store
+nxnative/
+.claude/worktrees/
+.claude/settings.local.json
+build/
+DerivedData/
+.build/
+*.xcodeproj/
+xcuserdata/
+graphify-out/
+.claude/local.env
+.superpowers/
+Client/*.xcodeproj
+Client/build/
+Host/*.xcodeproj
+Host/build/

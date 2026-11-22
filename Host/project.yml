@@ -1,0 +1,40 @@
+# Source of truth for the Host app's Xcode project; the generated NxPortalHost.xcodeproj is git-ignored.
+# The bundle prefix and the signing team come from the build environment (scripts/host.sh), never from this file.
+name: NxPortalHost
+options:
+  bundleIdPrefix: nxportal
+  createIntermediateGroups: true
+settings:
+  base:
+    SWIFT_VERSION: 6.0
+    PORTAL_BUNDLE_PREFIX: ""
+    DEVELOPMENT_TEAM: ""
+    CODE_SIGN_STYLE: Automatic
+    MARKETING_VERSION: "1.0"
+    CURRENT_PROJECT_VERSION: 1
+packages:
+  PortalKit:
+    path: ../PortalKit
+targets:
+  NxPortalHost:
+    type: application
+    platform: macOS
+    deploymentTarget: "14.0"
+    sources:
+      - Sources
+      - Resources/Assets.xcassets
+    dependencies:
+      - package: PortalKit
+        product: PortalKit
+      - package: PortalKit
+        product: PortalHostCore
+      - package: PortalKit
+        product: PortalHostModel
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: $(PORTAL_BUNDLE_PREFIX).nxportal.host
+        PRODUCT_NAME: nxPortal Host
+        INFOPLIST_FILE: Resources/Info.plist
+        ASSETCATALOG_COMPILER_APPICON_NAME: AppIcon
+        ENABLE_HARDENED_RUNTIME: YES
+        ENABLE_APP_SANDBOX: NO

@@ -1,0 +1,2010 @@
+diff --git a/dm/gfx/nvn/hle_nvn.c b/dm/gfx/nvn/hle_nvn.c
+index 0e25a6a5d3cfb4eba129c9208afb25239140a16c..00c441283f43e0e11005fdb75e7a8c0bf5fb4c91 100644
+--- a/dm/gfx/nvn/hle_nvn.c
++++ b/dm/gfx/nvn/hle_nvn.c
+@@ -1980,6 +1980,7 @@ void dm_gfx_suspend(int on) {
+     if (timed_out) dispatch_async_f(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), (void *)timed_out, gfx_suspend_timeout);
+ }
+ void dm_gfx_quit(int wait_ms) { mtl_arch_save(wait_ms, 1); }
++int dm_gfx_quit_ms(void) { return mtl_stream_preparing() ? DM_QUIT_PREPARE_MS : DM_QUIT_ARCH_MS; }
+ void dm_gfx_quit_begin(void) { mtl_warm_stop(); mtl_arch_save(0, 0); }   // the end's first step: no more prewarm compiles, and what the archive holds starts writing beside the drain (which can wait on a draw that compiles)
+ _Static_assert(DM_QUIT_ARCH_MS == MTL_QUIT_ARCH_MS, "a graceful exit gives the pipeline archive the time a quit does");
+ // One submission at a time: the Metal replay keeps one command buffer and one upload batch for the submission in progress (nvn_mtl.m g_cb). Fire Emblem: Three Houses initializes two queues and
+diff --git a/dm/gfx/nvn/nvn_mtl.h b/dm/gfx/nvn/nvn_mtl.h
+index 25f938cdfcfd40522f2294762f28dfd264bac9b2..0bac29b1cbd47659c46cac36b3ea02044055cc1a 100644
+--- a/dm/gfx/nvn/nvn_mtl.h
++++ b/dm/gfx/nvn/nvn_mtl.h
+@@ -59,6 +59,7 @@ void mtl_drop_queued_presents(void);                 // Release queued frames wi
+ void mtl_suspend_drain(void);                        // Wait for existing work only, on the suspend worker
+ void mtl_arch_save(int wait_ms, int ending);         // The pipeline archive's unwritten captures, written now even during the prewarm (going to the background, quitting); ending: the process ends after waiting up to wait_ms
+ enum { MTL_QUIT_ARCH_MS = 10000 };   // what quitting gives the archive's write (atexit; the graceful exit: dm.h DM_QUIT_ARCH_MS, the same): a file of 900 bases took 1.8-4 s on Macs
++int mtl_stream_preparing(void);   // the stream's prepare step is under way (DM_STREAM: the Host shown its progress, the game's first frame not yet drawn)
+ void mtl_warm_stop(void);   // the process is ending: the pipeline prewarm takes no more lines, and what it has not built is left to the next start (no compiles beside the archive's write)
+ // External producers (the Vulkan layer, dm/gfx/vk): the shared Metal device; a serial for one of their textures; present it once their event reaches ev_val (ticket for mtl_present_wait)
+ void *mtl_device(void);
+diff --git a/dm/gfx/nvn/nvn_mtl.m b/dm/gfx/nvn/nvn_mtl.m
+index e85d2aa4e9f5afdbaefc7a1d20158ebcc5f851d7..a822a64bdd8ffdc30b1fe8a395fb8d53b667497f 100644
+--- a/dm/gfx/nvn/nvn_mtl.m
++++ b/dm/gfx/nvn/nvn_mtl.m
+@@ -64,6 +64,7 @@ static uint64_t c2_handle(int stage, unsigned b);   // the handle c2 holds at by
+ #include "nvn_hmap.h"
+ #include "nvn_owner.h"   // the serial tables (serial_put, tex_put, tex_get, the pins, the held counts) and their lock g_smu
+ #include "../../host/dm.h"
++#include "../../host/stream.h"   // stream_on, the prepare step's messages (weak here: the tap is Mac only)
+ #import <CommonCrypto/CommonDigest.h>
+ #include <stdarg.h>
+ #include <mach-o/dyld.h>
+@@ -3205,7 +3206,7 @@ static BOOL obj_is_tex(id object) {
+     return is_texture;
+ }
+ 
+-static int g_red_once[178];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
++static int g_red_once[179];   // one past the highest key: a new key raises this, and the macro refuses to compile otherwise
+ #define RED_ONCE(k, ...) do { _Static_assert((k) < sizeof g_red_once / sizeof *g_red_once, "a RED_ONCE key past g_red_once: raise its size"); if (!g_red_once[k]++) MLOG("[RED] " __VA_ARGS__); } while (0)
+ // NVN vertex streams 0–15 → Metal vertex buffer slots: 0–13 go to 16–29 (30 is the constant fallback buffer), 14 and 15 to 14 and 15. Metal has only the 31 slots 0–30; translated shaders use only buffer(0) (the argument buffer),
+ // and the host's own vertex functions read no vertex buffers. 13 Sentinels uses stream 15, and the old 16 + stream went out of range (Metal assertion: buffer index (31) must be < 31)
+@@ -11246,7 +11247,7 @@ static void arch_write_file(ArchEpoch *ep, int gate_held) {
+ // over once it is that old, and each next one waits twice as long, up to 16 times (60 s, 120 s, ... 16 min), so a long cold start's prewarm adds a file per doubling and not one per
+ // 10 s. Without it, a prewarm that outlived the run (Ocarina of Time without a window: 31,663 lines after the first frame, every warm-up run of 2026-11-10) wrote nothing until the
+ // exit, and the 1.3 s the SIGTERM exit left could not write the ~425 bases it held (1.8-4 s for 900): every next run compiled them again, 57-167 bases at area loads (PR #2625). Not
+-// in the prepare step, which ends before the first frame (a quit there gets MTL_QUIT_ARCH_MS for at most a period), nor while a compaction runs: their bases go into as few files as
++// in the prepare step, which ends before the first frame (a quit there gets MTL_QUIT_ARCH_MS for at most a period; DM_QUIT_PREPARE_MS in the stream), nor while a compaction runs: their bases go into as few files as
+ // they can. No cap by count: a period handed over at 512 makes a file of the top compacted tier, and a cold start's 8,600 bases in 16 of them would make the next start compact them
+ static int g_warm_flush_ms = -1; static _Atomic int g_warm_flushes;
+ static int arch_warm_flush_due(void) {
+@@ -11260,7 +11261,9 @@ enum ArchFlush { ARCH_FLUSH_NORMAL, ARCH_FLUSH_NOW, ARCH_FLUSH_TIMER };
+ static int arch_hand_over(ArchEpoch *only, enum ArchFlush mode) {
+     int warm_due = 0;
+     if (!g_arch_cap || (!only && mode != ARCH_FLUSH_NOW && atomic_load(&g_warm_running) && !(warm_due = arch_warm_flush_due()))) return 0;
+-    int windowed_timer = mode == ARCH_FLUSH_TIMER && mtl_has_window();
++    // DM_STREAM: no layer, but a game being played (dm/host/stream.h); except a background prewarm's due write (DM_STREAM_PREPARE=0: the prewarm runs through play, and its
++    // doubling cadence is what keeps a crash from losing its bases; a window reaches that prewarm only with DM_PSO_PREPARE=0)
++    int windowed_timer = mode == ARCH_FLUSH_TIMER && (mtl_has_window() || (stream_on() && !warm_due));
+     if (windowed_timer && arch_recent_present()) return 1;
+     os_unfair_lock_lock(&g_ep_lock);
+     int active = atomic_load(&g_ep->active);
+@@ -12383,13 +12386,25 @@ int mtl_warm_wait(int timeout_ms) {
+ // pressure on iOS), which is when it is needed. DM_PSO_PREPARE=0: the prewarm runs in the background as before (as it does without a window); DM_PSO_PREPARE_THREADS=<n> sets the workers
+ void front_progress(const char *title, long done, long total);
+ __attribute__((weak)) void front_progress(const char *title, long done, long total) { (void)title; (void)done; (void)total; }   // the front ends' (front.h); none in the unit tests
++// The streaming tap's (dm/host/stream_mac.c, Mac only); none on iOS and in the unit tests. With DM_STREAM there is no window: the tap stands in for it (stream_prepare_wanted), and the
++// Host is told the progress in prepare messages instead of a screen; without it the stream started with the prewarm and the prebuild in the background, and a cold start compiled
++// them while playing (a black picture for minutes, then stalls of seconds at draws). DM_STREAM_PREPARE=0: in the background as before
++__attribute__((weak)) int stream_prepare_wanted(void) { return 0; }
++__attribute__((weak)) void stream_prepare_begin(void) {}
++__attribute__((weak)) void stream_prepare(int phase, long done, long total) { (void)phase; (void)done; (void)total; }
++__attribute__((weak)) void stream_prepare_end(void) {}
++static _Atomic int g_prep_stream;   // the prepare step under way is the stream's (mtl_stream_preparing)
+ static int prepare_on(void) {
+     static int v = -1;
+     if (v < 0) { const char *e = getenv("DM_PSO_PREPARE");
+         if (e && !strcmp(e, "0")) { MLOG("DM_PSO_PREPARE=0: the pipeline prewarm runs in the background, the game does not wait for it"); v = 0; }
+-        else v = (e && !strcmp(e, "1")) || front_metal_layer() != NULL; }
++        else if ((e && !strcmp(e, "1")) || front_metal_layer() != NULL) v = 1;
++        else v = stream_prepare_wanted();
++        if (!v && stream_on()) MLOG("stream: the pipeline prewarm and prebuild run in the background while playing (DM_STREAM_PREPARE=0 or DM_PSO_PREPARE=0)"); }
+     return v;
+ }
++static int prepare_stream(void) { static int v = -1; if (v < 0) v = prepare_on() && front_metal_layer() == NULL && stream_on(); return v; }
++int mtl_stream_preparing(void) { return atomic_load(&g_prep_stream); }
+ static int prepare_workers(void) {
+     const char *e = getenv("DM_PSO_PREPARE_THREADS"); int n = e ? atoi(e) : 0;
+     if (n <= 0) { size_t sz = sizeof n; if (sysctlbyname("hw.activecpu", &n, &sz, NULL, 0) || n < 2) n = 2; }
+@@ -12404,13 +12419,16 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
+         for (;;) { long i = atomic_fetch_add(&next, 1); if (i >= n || atomic_load(&g_warm_stop)) break; warm_task(tasks[(NSUInteger)i]); }
+     });
+     int shown = 0;
++    stream_prepare(STREAM_PREPARE_LISTS, 0, lines);   // the Host's progress (the tap sends at most 4 a second): from the start, it shows no screen of ours
+     while (dispatch_group_wait(g, dispatch_time(DISPATCH_TIME_NOW, 50 * (int64_t)NSEC_PER_MSEC))) {
+         // the screen shows past 0.5 s, unless the rate so far says the rest takes less than 0.3 s more (no screen that flashes up and goes)
+         uint64_t el = bp_now() - t0; long done = g_warm_done; double rest = done ? (double)el * (double)(lines - done) / (double)done : 1e18;
+         if (!shown && el >= 500000000ull && rest >= 3e8) { shown = 1; MLOG("pipeline prepare: %ld of %ld lines done after %.1f s, the progress screen shows", done, lines, el / 1e9); }
+         if (shown) front_progress("Preparing shaders", g_warm_done, lines);
++        stream_prepare(STREAM_PREPARE_LISTS, MIN(done, lines - 1), lines);   // done == total only at the end
+     }
+     if (shown) front_progress(NULL, lines, lines);
++    if (!atomic_load(&g_warm_stop)) stream_prepare(STREAM_PREPARE_LISTS, lines, lines);
+     char again[64] = "";   // only a compacting start captures bases again
+     if (g_compact_enabled) snprintf(again, sizeof again, " (%d of them captured again for the compaction)", (int)g_compact_bases);
+     MLOG("pipeline prepare: %ld lines (%llu shaders, %llu render pipelines, %llu compute pipelines) in %.2f s on %d workers before the first frame, progress screen %s; "
+@@ -12423,12 +12441,14 @@ static void warm_prepare(NSArray<WarmTask *> *tasks, long lines) {
+ // from about 13 to 15-18 ms a frame in Breath of the Wild (the compiler's load on the shared power budget); a first start waits for them instead. It waits until every pair is
+ // handed to a worker: the compiles still under way then (at most one per worker) finish in the background, so one that does not return (a base Apple's compiler cannot build,
+ // GitHub issue #294) does not hold the game's start
+-static void prepare_prebuild(void) {
+-    const char *e = getenv("DM_PSO_PREBUILD"); if (e && !strcmp(e, "0")) return;
+-    if (!hybrid_on()) return;
++// → the pairs handed out, 0 when none was to build (already built for this version, or off)
++static int prepare_prebuild(void) {
++    const char *e = getenv("DM_PSO_PREBUILD"); if (e && !strcmp(e, "0")) return 0;
++    if (!hybrid_on()) return 0;
+     int n = pso_prebuild(prepare_workers(), 0, QOS_CLASS_USER_INITIATED);
+-    if (n <= 0) return;
++    if (n <= 0) return 0;
+     uint64_t t0 = bp_now(); int shown = 0;
++    stream_prepare(STREAM_PREPARE_PAIRS, 0, n);
+     // every pair handed out and none put back (pre_pair): a pair whose shader function was under way waits in g_pre_later, and counts as not yet built
+     for (;;) {
+         pthread_mutex_lock(&g_fn_mu); int later = g_pre_later_n; pthread_mutex_unlock(&g_fn_mu);
+@@ -12436,10 +12456,13 @@ static void prepare_prebuild(void) {
+         usleep(50000);
+         if (!shown && bp_now() - t0 >= 500000000ull) shown = 1;
+         if (shown) front_progress("Preparing pipelines", g_pre_done, n);
++        stream_prepare(STREAM_PREPARE_PAIRS, MIN((int)g_pre_done, n - 1), n);   // done == total only at the end
+     }
+     int left = atomic_load(&g_pre_running) ? n - (int)g_pre_done : 0;   // a worker's last compile can still be under way
+     if (left > 0) MLOG("pipeline prepare: every shader pair handed out after %.1f s; %d compiles still under way finish in the background", (bp_now() - t0) / 1e9, left);
+     if (shown) front_progress(NULL, n, n);
++    if (!atomic_load(&g_warm_stop)) stream_prepare(STREAM_PREPARE_PAIRS, n, n);   // the phase ends when every pair is handed out, as the screen's does
++    return n;
+ }
+ // ---- The prebuild tool: what a first start would build, made with no game ----
+ // The prewarm lists a start reads: DM_PSO_MANIFEST=<file> alone, else the profile's pso_manifest.tsv (beside the shader map) and this device's pso_user.tsv; none for
+@@ -12549,6 +12572,9 @@ static void warm_start(void) {
+     if (g_warm_started++) return;
+     NSArray<NSString *> *paths = warm_paths(getenv("DM_PSO_MANIFEST"));
+     if (!paths) return;
++    // The stream's prepare step: no video or audio from here until it ends (the Host was told the game is alive by the hello, at the connection, before the guest started)
++    int st = prepare_stream(); uint64_t st0 = bp_now();
++    if (st) { atomic_store(&g_prep_stream, 1); stream_prepare_begin(); MLOG("stream prepare: the pipelines before the first frame, the Host shown the progress (DM_STREAM_PREPARE=0: in the background while playing)"); }
+     warm_load_begin();
+     pso4_init();   // the pipeline archive opens before the prewarm builds from it
+     g_warm_t0 = bp_now();
+@@ -12556,10 +12582,17 @@ static void warm_start(void) {
+     if (prepare_on()) {
+         long lines = 0; NSArray<WarmTask *> *tasks = warm_parse(paths, &lines);
+         if (lines) warm_prepare(tasks, lines);
+-        else MLOG("pipeline prepare: the prewarm lists hold nothing to build");
++        else { MLOG("pipeline prepare: the prewarm lists hold nothing to build"); stream_prepare(STREAM_PREPARE_LISTS, 0, 0); }
+         if (atomic_load(&g_warm_stop)) return;   // the process is ending: what is left is built at the next start
+         warm_finish();
+-        @autoreleasepool { prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
++        int pairs; @autoreleasepool { pairs = prepare_prebuild(); }   // then the bases every shader pair's hybrid draws need, before the first frame too (once)
++        if (st && !atomic_load(&g_warm_stop)) {
++            char pp[160] = "none to build (built for this version, or DM_PSO_PREBUILD=0)";
++            if (pairs) snprintf(pp, sizeof pp, "%d handed out (%d bases built, %d already archived, %d left to the draws, %d failed so far)", pairs, (int)g_pre_built, (int)g_pre_archived, (int)g_pre_skipped, (int)g_pre_failed);
++            MLOG("stream prepare done in %.1f s: %ld prewarm lines (%llu render, %llu compute, %llu task / mesh pipelines, %d failed); shader pairs: %s; the first frame follows",
++                 (bp_now() - st0) / 1e9, lines, (unsigned long long)g_warm_rps, (unsigned long long)g_warm_cps, (unsigned long long)g_warm_mps, (int)g_pre_warm_failed, pp);
++            atomic_store(&g_prep_stream, 0); stream_prepare_end();
++        }
+         return;
+     }
+     dispatch_queue_attr_t attr = dispatch_queue_attr_make_with_qos_class(DISPATCH_QUEUE_SERIAL, QOS_CLASS_USER_INITIATED, 0);   // Not optional background work: it decides whether the pipelines are ready before the player enters a run
+@@ -19775,6 +19808,53 @@ static void present_gpu_note(double s, int fx) {
+     MLOG("present command buffer GPU time over 600 presents %s: p50 %.3f ms, p95 %.3f ms, max %.3f ms", fx ? "through MetalFX" : "through the bilinear pass", a[299], a[569], a[599]);
+     n[fx] = 0;
+ }
++#if TARGET_OS_OSX
++#include "../../host/stream.h"
++#import <IOSurface/IOSurfaceObjC.h>   // the surface's size by message: the graphics unit tests link no IOSurface framework
++// DM_STREAM (dm/host/stream_video_mac.m): weak no-ops where the encoder is not linked (the graphics unit tests)
++__attribute__((weak)) void *stream_video_surface(int pic_w, int pic_h, int *slot) { (void)pic_w; (void)pic_h; (void)slot; return NULL; }
++__attribute__((weak)) void stream_video_submit(int slot, uint64_t capture_ns) { (void)slot; (void)capture_ns; }
++__attribute__((weak)) void stream_video_abort(int slot) { (void)slot; }
++// The present pass drawn into the encoder's surface of a slot instead of a drawable. Each slot has its own texture over its surface (resident, made again when the surface
++// changes), allocator, command buffer and crop constants; stream_video_surface hands a slot out again only after its commit feedback has run, so its allocator is idle at the reset.
++// Returns 1 when it committed: as a display present, the commit counts in g_pq_inflight and its feedback does the ticket and retires released external textures (a Vulkan or
++// GL image released meanwhile left the residency set under the running pass: a page fault). No screen shows it, so it is "seen" at once (the screen wait paces as before).
++// Returns 0 when nothing was committed (no slot, the cap, a failure): the caller releases the ticket as for a windowless run
++static id<MTLTexture> g_st_tex[3]; static void *g_st_surf[3]; static id<MTL4CommandAllocator> g_st_alloc[3]; static id<MTL4CommandBuffer> g_st_cb[3]; static id<MTLBuffer> g_st_uv[3];
++static int stream_present(id<MTLTexture> src, const int crop[4], uint64_t ticket) {
++    uint64_t ns = clock_gettime_nsec_np(CLOCK_UPTIME_RAW); double w, h; int i = 0; present_shape(src, crop, &w, &h);
++    void *s = stream_video_surface((int)w, (int)h, &i); if (!s) return 0;
++    if (!g_st_alloc[i]) { g_st_alloc[i] = [g_dev newCommandAllocator]; g_st_cb[i] = [g_dev newCommandBuffer];
++        g_st_uv[i] = [g_dev newBufferWithLength:sizeof(float) * 8 options:MTLResourceStorageModeShared]; res_add(g_st_uv[i]); }
++    if (g_st_surf[i] != s) {   // the old texture holds the old surface, so an equal pointer is the same surface
++        IOSurface *io = (__bridge IOSurface *)s; res_remove(g_st_tex[i]);
++        MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatBGRA8Unorm width:io.width height:io.height mipmapped:NO];
++        d.usage = MTLTextureUsageRenderTarget; d.storageMode = MTLStorageModeShared;
++        g_st_tex[i] = [g_dev newTextureWithDescriptor:d iosurface:(__bridge IOSurfaceRef)io plane:0]; g_st_surf[i] = g_st_tex[i] ? s : NULL; res_add(g_st_tex[i]);
++    }
++    if (!g_st_alloc[i] || !g_st_cb[i] || !g_st_uv[i] || !g_st_tex[i]) { RED_ONCE(178, "stream: no command allocator, buffer or surface texture"); stream_video_abort(i); return 0; }
++    res_commit();   // the surface's texture resident before the command buffer names the set: a page fault would stop every later command buffer of the process
++    [g_st_alloc[i] reset];
++    id<MTL4CommandBuffer> cb = g_st_cb[i];
++    [cb beginCommandBufferWithAllocator:g_st_alloc[i]];
++    int kind = present_encode_m4(cb, src, g_st_tex[i], crop, g_st_uv[i], NULL);
++    cb_end(cb, nil);
++    if (!kind) { stream_video_abort(i); return 0; }
++    MTL4CommitOptions *o = [MTL4CommitOptions new];
++    [o addFeedbackHandler:^(id<MTL4CommitFeedback> f) {
++        if (f.error) { MLOG("[RED] stream command buffer error: %s", f.error.description.UTF8String); gpu_lost_check(f.error, "stream"); stream_video_abort(i); }
++        else stream_video_submit(i, ns);
++        pthread_mutex_lock(&g_pq_mu); if (ticket > g_pq_done) g_pq_done = ticket; g_pq_inflight--; pthread_cond_broadcast(&g_pq_cv);
++        NSArray *retire = nil; if (!g_pq_inflight && g_ext_retire.count) { retire = g_ext_retire; g_ext_retire = nil; }   // as the display handler
++        pthread_mutex_unlock(&g_pq_mu);
++        if (retire) ext_retire(retire);
++    }];
++    pthread_mutex_lock(&g_pq_mu); g_pq_inflight++; pthread_mutex_unlock(&g_pq_mu);
++    [g_q4 commit:&cb count:1 options:o];
++    pres_seen(ticket, -1);
++    return 1;
++}
++#endif
+ static double g_link_it_tin;   // Enqueue time of the frame the display-link callback is presenting (read and written only on the display-link thread)
+ // External presents wait on g_q4, but diagnostic readback can use another queue. Wait for the producer before any read of that frame.
+ static id<MTLSharedEvent> g_ext_ev;
+@@ -19847,6 +19927,9 @@ static int present_now(const tex_t *t, double period, uint64_t frame, uint64_t t
+     pthread_mutex_unlock(&g_shotq_mu);
+ 
+     if (atomic_load(&g_gpu_lost) || atomic_load(&g_present_suspended)) return 0;
++#if TARGET_OS_OSX
++    if (stream_on()) return stream_present(src, crop, ticket);   // DM_STREAM: to the encoder, never to a window (dm/host/stream.h)
++#endif
+     CAMetalLayer *layer = (__bridge CAMetalLayer *)front_metal_layer();
+     if (!layer) return 0;
+ #if TARGET_OS_OSX
+diff --git a/dm/gfx/tests/Makefile b/dm/gfx/tests/Makefile
+index 2186e87bb96ad51bc825aeef0ab3d7bfd8d1f429..6b2fbfc0f74489210edc5e6c8eaf597e8898b3e1 100644
+--- a/dm/gfx/tests/Makefile
++++ b/dm/gfx/tests/Makefile
+@@ -47,10 +47,10 @@ check_t_rt_unbind: t_rt_unbind
+ 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 DM_NVN_UNBIND_DEFER=0 ./t_rt_unbind
+ # The run list: every t_*.c and t_*.m but those in NOT_RUN. `make run` builds them all (in parallel with -j), then runs them one after another, each through its check_
+ # target: ./t_x by default, with the environment its RUN_ENV gives it (check_t_x: RUN_ENV = MTL_DEBUG_LAYER=1, beside its build rule), or a check_t_x recipe of its own when it
+-# runs several ways. A new test needs its source and its build rule; no list to add it to. NOT_RUN: helpers linked into other tests (t_host_stubs, t_present_rescue_focus, t_gpu_lost_front),
++# runs several ways. A new test needs its source and its build rule; no list to add it to. NOT_RUN: helpers linked into other tests (t_host_stubs, t_stream_prepare_tap, t_present_rescue_focus, t_gpu_lost_front),
+ # fixtures test_image_atomic_bounds.py and test_global_memory.py build themselves (t_atomic_return, t_global_memory), t_geometry_primitive_id (the GPU half of test_dmsh_geometry.py, which gives it the directory of
+ # its translated fixtures), t_compute_loops (test_dmsh_compute_loops.py supplies its rewritten fixtures), t_gpuprof, which CI's CPU subset runs (.github/workflows/tests.yml), and t_gpu_fault_kinds, whose cases fault the GPU on purpose
+-NOT_RUN = t_host_stubs t_present_rescue_focus t_gpu_lost_front t_atomic_return t_global_memory t_geometry_primitive_id t_compute_loops t_gpuprof t_gpu_fault_kinds
++NOT_RUN = t_host_stubs t_stream_prepare_tap t_present_rescue_focus t_gpu_lost_front t_atomic_return t_global_memory t_geometry_primitive_id t_compute_loops t_gpuprof t_gpu_fault_kinds
+ RUN_TESTS = $(filter-out $(NOT_RUN),$(basename $(sort $(wildcard t_*.c t_*.m))))
+ check_t_%: t_%
+ 	$(RUN_ENV) ./$<
+@@ -326,6 +326,12 @@ t_present_alloc: t_present_alloc.m $(MTL_T_DEP)
+ .PHONY: check_t_present_alloc
+ check_t_present_alloc: t_present_alloc
+ 	MTL_DEBUG_LAYER=1 ./t_present_alloc
++# DM_STREAM: the present drawn into the stream's IOSurface and encoded (dm/host/stream_video_mac.m), no window
++t_stream_present: t_stream_present.m ../../host/stream_video_mac.m ../../host/stream.h $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_stream_present.m ../../host/stream_video_mac.m $(MTL_T_SRC) $(FW) -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface
++.PHONY: check_t_stream_present
++check_t_stream_present: t_stream_present
++	MTL_DEBUG_LAYER=1 ./t_stream_present
+ # A GPU whose access macOS revoked (DM_TEST_GPU_LOST, set by the test): the front end told once, the game's waits released, presents stopped
+ t_gpu_lost: t_gpu_lost.m t_gpu_lost_front.c $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_gpu_lost.m t_gpu_lost_front.c $(MTL_T_SRC) $(FW)
+@@ -519,6 +525,7 @@ t_pso_archive: t_pso_archive.m $(MTL_T_DEP) ../../host/hle_lifecycle.c
+ check_t_pso_archive: t_pso_archive
+ 	MTL_DEBUG_LAYER=1 ./t_pso_archive
+ 	MTL_DEBUG_LAYER=1 ./t_pso_archive --active-flush
++	DM_STREAM=1 MTL_DEBUG_LAYER=1 ./t_pso_archive --stream-flush
+ 	MTL_DEBUG_LAYER=1 python3 test_pso_archive.py "$(CURDIR)/t_pso_archive"
+ t_pso_bundle: t_pso_bundle.m ../tools/pso_offline.py $(MTL_T_DEP)
+ 	clang $(CFLAGS) -fobjc-arc -o $@ t_pso_bundle.m $(MTL_T_SRC) $(FW)
+@@ -981,3 +988,6 @@ t_depth_bounds: t_depth_bounds.m $(MTL_T_DEP)
+ check_t_depth_bounds: t_depth_bounds
+ 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=0 ./$<
+ 	MTL_DEBUG_LAYER=1 DM_NVN_ENC_THREAD=1 ./$<
++# DM_STREAM's prepare step on the graphics side: prepare_on, warm_start's begin / end with the tap, dm_gfx_quit_ms (the tap's calls recorded by t_stream_prepare_tap.c)
++t_stream_prepare: t_stream_prepare.m t_stream_prepare_tap.c $(MTL_T_DEP)
++	clang $(CFLAGS) -fobjc-arc -o $@ t_stream_prepare.m t_stream_prepare_tap.c $(MTL_T_SRC) $(FW)
+diff --git a/dm/gfx/tests/t_pso_archive.m b/dm/gfx/tests/t_pso_archive.m
+index 9baee17ad83608c29ebae88caff047eaa2706b3f..f682eed871283966d31451aeea471a5d833eaf52 100644
+--- a/dm/gfx/tests/t_pso_archive.m
++++ b/dm/gfx/tests/t_pso_archive.m
+@@ -885,6 +885,39 @@ int main(int argc, char **argv) { @autoreleasepool {
+         printf("t_pso_archive active flush: %d checks, %d failed\n", checks, failed);
+         return failed != 0;
+     }
++    if (argc == 2 && !strcmp(argv[1], "--stream-flush")) {   // DM_STREAM set by the Makefile: no layer, but a game played through the stream, so the timer defers as in a window
++        pso4_init();
++        test_archive_timer = 1;
++        const uint64_t idle_ns = (ARCH_FLUSH_INTERVAL_S + 1) * (uint64_t)NSEC_PER_SEC;
++        MTLRenderPipelineDescriptor *cd = desc(MTLPixelFormatRGBA8Unorm, 0, MTLPixelFormatRGBA8Unorm, MTLColorWriteMaskAll, 1);
++        EXPECT("stream: DM_STREAM set and no layer", 1, stream_on() && !mtl_has_window());
++        EXPECT("stream: capture before the timer", 1, pso_build(cd, 0, &err) != nil && atomic_load(&g_arch_new) == 1);
++        atomic_store(&dm_present_ns, now_ns());
++        fire_archive_timer();
++        dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER);
++        EXPECT("stream: the timer writes nothing while the stream presents", 0, archive_files(@(dir)).count);
++        EXPECT("stream: the partial period is still pending", 1, atomic_load(&g_arch_new));
++        atomic_store(&dm_present_ns, now_ns() - idle_ns);
++        fire_archive_timer();
++        dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER);
++        EXPECT("stream: the retry wrote the archive once the stream was idle", 1, archive_files(@(dir)).count);
++        EXPECT("stream: the partial period was drained", 0, atomic_load(&g_arch_new));
++        // DM_STREAM_PREPARE=0: the prewarm runs through play, and its due write (arch_warm_flush_due) goes ahead while the stream presents
++        atomic_store(&g_warm_running, 1); atomic_store(&g_warm_bg, 1); g_warm_flush_ms = 1;
++        cd.vertexDescriptor.layouts[16].stride += 16;
++        EXPECT("stream: capture during a background prewarm", 1, pso_build(cd, 0, &err) != nil && atomic_load(&g_arch_new) == 1);
++        usleep(50000);   // the period older than the warm flush's wait (1 ms, doubled per flush up to 16 times)
++        atomic_store(&dm_present_ns, now_ns());
++        EXPECT("stream: the background prewarm's write is due", 1, arch_warm_flush_due());
++        fire_archive_timer();
++        dispatch_group_wait(g_arch_pending, DISPATCH_TIME_FOREVER);
++        EXPECT("stream: the prewarm's due write goes ahead while the stream presents", 2, archive_files(@(dir)).count);
++        EXPECT("stream: the prewarm's period was drained", 0, atomic_load(&g_arch_new));
++        atomic_store(&g_warm_running, 0); atomic_store(&g_warm_bg, 0);
++        [NSFileManager.defaultManager removeItemAtPath:@(dir) error:nil];
++        printf("t_pso_archive stream flush: %d checks, %d failed\n", checks, failed);
++        return failed != 0;
++    }
+     if (argc == 3 && !strncmp(argv[1], "--cold-", 7)) {   // across fresh processes: a cold start's prewarm with a timer flush after each new base, then the next start
+         g_arch_period_max = 4; int seed = !strcmp(argv[1], "--cold-seed"), cut = !strcmp(argv[1], "--cold-cut-seed"), after_cut = !strcmp(argv[1], "--cold-after-cut");
+         int quit = !strcmp(argv[1], "--cold-quit-seed"), after_quit = !strcmp(argv[1], "--cold-after-quit");
+diff --git a/dm/gfx/tests/t_stream_prepare.m b/dm/gfx/tests/t_stream_prepare.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..d31303e43ce172295a8e9a680cf8d66bea9f4137
+--- /dev/null
++++ b/dm/gfx/tests/t_stream_prepare.m
+@@ -0,0 +1,58 @@
++// DM_STREAM's prepare step on the graphics side (nvn_mtl.m prepare_on, warm_start; hle_nvn.c dm_gfx_quit_ms): with the tap connected and no window, the first submission's prepare
++// step runs before the first frame, between the tap's begin and end, and while it runs a graceful exit gives the archive DM_QUIT_PREPARE_MS, else DM_QUIT_ARCH_MS. With
++// DM_STREAM_PREPARE=0 (the tap's stream_prepare_wanted says no) there is no prepare step and no begin. Each case runs in a process of its own (prepare_on is read once): this binary
++// runs itself with --case. The tap's calls are recorded by t_stream_prepare_tap.c; the prewarm list is one comment line (phase 1: 0 of 0) and DM_PSO_PREBUILD=0 (no phase 2)
++#include "../nvn/nvn_mtl.m"
++void *front_metal_layer(void) { return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++extern int g_tap_wanted_n, g_tap_begin_n, g_tap_end_n, g_tap_prep_n, g_tap_last[3], g_tap_prep_preparing, g_tap_prep_quit_ms;
++
++static int checks, failed;
++#define EXPECT(name, want, got) do { long w_ = (long)(want), g_ = (long)(got); checks++; \
++    if (w_ != g_) { fprintf(stderr, "%s: expected %ld, got %ld\n", name, w_, g_); failed++; } } while (0)
++
++static int one_case(const char *c) {
++    int on = !strcmp(c, "on");
++    EXPECT("before the first submission: not preparing, the exit gives the archive DM_QUIT_ARCH_MS", DM_QUIT_ARCH_MS, dm_gfx_quit_ms());
++    mtl_prepare();   // the first submission's prepare step
++    EXPECT("the prepare step is on", on, prepare_on());
++    EXPECT("the tap's begin", on, g_tap_begin_n);
++    EXPECT("the tap's end", on, g_tap_end_n);
++    EXPECT("one prepare call: phase 1, 0 of 0 (the list holds nothing)", on, g_tap_prep_n);
++    if (on) {
++        EXPECT("phase 1", 1, g_tap_last[0]); EXPECT("done 0", 0, g_tap_last[1]); EXPECT("total 0", 0, g_tap_last[2]);
++        EXPECT("during it: the stream's prepare step is under way", 1, g_tap_prep_preparing);
++        EXPECT("during it: the exit gives the archive DM_QUIT_PREPARE_MS", DM_QUIT_PREPARE_MS, g_tap_prep_quit_ms);
++    }
++    EXPECT("after it: not preparing", 0, mtl_stream_preparing());
++    EXPECT("after it: the exit gives the archive DM_QUIT_ARCH_MS", DM_QUIT_ARCH_MS, dm_gfx_quit_ms());
++    printf("t_stream_prepare --case %s: %d checks, %d failed\n", c, checks, failed);
++    return failed != 0;
++}
++static int run_self(const char *c, NSDictionary<NSString *, NSString *> *env) {
++    NSMutableDictionary *e = [NSProcessInfo.processInfo.environment mutableCopy]; [e addEntriesFromDictionary:env];
++    NSTask *t = [NSTask new]; t.executableURL = [NSURL fileURLWithPath:NSProcessInfo.processInfo.arguments[0]]; t.arguments = @[@"--case", @(c)]; t.environment = e;
++    if (![t launchAndReturnError:nil]) return -1;
++    [t waitUntilExit]; return t.terminationStatus;
++}
++int main(int argc, char **argv) {
++    if (argc == 3 && !strcmp(argv[1], "--case")) return one_case(argv[2]);
++    @autoreleasepool {
++        NSString *dir = [NSTemporaryDirectory() stringByAppendingPathComponent:[NSString stringWithFormat:@"t_stream_prepare.%d", getpid()]], *list = [dir stringByAppendingPathComponent:@"pso_manifest.tsv"];
++        [NSFileManager.defaultManager createDirectoryAtPath:dir withIntermediateDirectories:YES attributes:nil error:nil];
++        [@"# nothing to build\n" writeToFile:list atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        NSString *map = [dir stringByAppendingPathComponent:@"shader_map.tsv"];   // a shader map with no shaders
++        [@"package\tindex\tstage\tdm_ctl_sha16\tsource\n" writeToFile:map atomically:YES encoding:NSUTF8StringEncoding error:nil];
++        NSDictionary *base = @{@"DM_STREAM": @"/nonexistent", @"DM_NVN_SHMAP": map, @"DM_MSL_DIR": dir, @"DM_PSO_MANIFEST": list, @"DM_PSO_PREBUILD": @"0", @"DM_PSO_HYBRID": @"0", @"DM_PSO_ARCHIVE": @"off"};
++        NSMutableDictionary *off = [base mutableCopy]; off[@"DM_STREAM_PREPARE"] = @"0";
++        int a = run_self("on", base), b = run_self("off", off);
++        EXPECT("stream, prepare wanted: the case passes", 0, a);
++        EXPECT("stream, DM_STREAM_PREPARE=0: the case passes", 0, b);
++        [NSFileManager.defaultManager removeItemAtPath:dir error:nil];
++    }
++    printf("t_stream_prepare: %d checks, %d failed\n", checks, failed);
++    return failed != 0;
++}
+diff --git a/dm/gfx/tests/t_stream_prepare_tap.c b/dm/gfx/tests/t_stream_prepare_tap.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..6d0d1f91e3b6aaff9ecdfaffef3f26f41e0ea842
+--- /dev/null
++++ b/dm/gfx/tests/t_stream_prepare_tap.c
+@@ -0,0 +1,12 @@
++// The tap's prepare calls (dm/host/stream_mac.c) for t_stream_prepare: strong definitions over nvn_mtl.m's weak ones. Each call is recorded with what the graphics side says while it is made
++#include <stdlib.h>
++#include <string.h>
++int mtl_stream_preparing(void); int dm_gfx_quit_ms(void);
++int g_tap_wanted_n, g_tap_begin_n, g_tap_end_n, g_tap_prep_n, g_tap_last[3], g_tap_prep_preparing, g_tap_prep_quit_ms, g_tap_begin_after_end;
++int stream_prepare_wanted(void) { const char *e = getenv("DM_STREAM_PREPARE"); g_tap_wanted_n++; return !(e && !strcmp(e, "0")); }
++void stream_prepare_begin(void) { g_tap_begin_n++; }
++void stream_prepare(int phase, long done, long total) {
++    g_tap_prep_n++; g_tap_last[0] = phase; g_tap_last[1] = (int)done; g_tap_last[2] = (int)total;
++    g_tap_prep_preparing = mtl_stream_preparing(); g_tap_prep_quit_ms = dm_gfx_quit_ms();
++}
++void stream_prepare_end(void) { g_tap_end_n++; }
+diff --git a/dm/gfx/tests/t_stream_present.m b/dm/gfx/tests/t_stream_present.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..234bc703f99fc15c01c4dc267e6ccdab60184621
+--- /dev/null
++++ b/dm/gfx/tests/t_stream_present.m
+@@ -0,0 +1,301 @@
++// DM_STREAM: present_now draws the picture into the stream's IOSurface and the encoder hands HEVC frames to the sink, never touching a window (dm/host/stream.h).
++// Real Metal 4 queue and VideoToolbox; frames are decoded back with VTDecompressionSession. One present at a time, at least 1/60 s apart, each waited for at the sink.
++// Long-term references: frames are decoded as a front end that lost some sees them, the refresh after the loss decoding without them
++#include "../nvn/nvn_mtl.m"
++#import <VideoToolbox/VideoToolbox.h>
++static int g_layer_calls;
++void *front_metal_layer(void) { g_layer_calls++; return NULL; }
++module_t *module_of(const void *p) { (void)p; return NULL; }
++module_t *g_mod; int g_nmod;
++void svc_thread_dump(void) {}
++uint64_t now_ns(void) { return bp_now(); }
++static int checks, failed;
++#define CHECK(name, ok) do { int pass = !!(ok); checks++; failed += !pass; printf("%s: %s\n", name, pass ? "PASS" : "FAIL"); } while (0)
++typedef struct { NSData *d; int fl, token, w, h; uint64_t ns; } frame;
++static frame g_fr[512]; static int g_nfr; static pthread_mutex_t g_fr_mu = PTHREAD_MUTEX_INITIALIZER; static dispatch_semaphore_t g_fr_sem;
++static void sink(const uint8_t *data, size_t n, int fl, int32_t token, int w, int h, uint64_t capture_ns) {
++    pthread_mutex_lock(&g_fr_mu); if (g_nfr < 512) g_fr[g_nfr++] = (frame){[NSData dataWithBytes:data length:n], fl, token, w, h, capture_ns}; pthread_mutex_unlock(&g_fr_mu);
++    dispatch_semaphore_signal(g_fr_sem);
++}
++static int frames(void) { pthread_mutex_lock(&g_fr_mu); int n = g_nfr; pthread_mutex_unlock(&g_fr_mu); return n; }
++static tex_t source(unsigned serial, int w, int h, uint8_t r, uint8_t g, uint8_t b) {   // one flat colour, RGBA8
++    MTLTextureDescriptor *d = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:w height:h mipmapped:NO];
++    d.storageMode = MTLStorageModeShared; d.usage = MTLTextureUsageShaderRead;
++    id<MTLTexture> mt = [g_dev newTextureWithDescriptor:d]; uint8_t *px = malloc((size_t)w * h * 4);
++    for (int i = 0; i < w * h; i++) { px[4 * i] = r; px[4 * i + 1] = g; px[4 * i + 2] = b; px[4 * i + 3] = 255; }
++    [mt replaceRegion:MTLRegionMake2D(0, 0, w, h) mipmapLevel:0 withBytes:px bytesPerRow:w * 4]; free(px);
++    tex_t t = {.magic=MAGIC('T','E','X',0), .serial=serial};
++    t.d.width = w; t.d.height = h; t.d.depth = t.d.levels = t.d.samples = 1;
++    t.d.target = NVN_TEXTURE_TARGET_2D; t.d.format = NVN_FORMAT_RGBA8;
++    serial_put(t.serial, mt); res_add(mt); res_commit(); return t;
++}
++static uint64_t g_ticket, g_last_ns; static int g_bad_returns, g_last_ret;
++static void present_at(const tex_t *t, uint64_t due) {   // at due (CLOCK_UPTIME_RAW): asleep until 8 ms before, then spinning, as a sleep can overrun by several ms
++    uint64_t now;
++    while ((now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) + 8000000 < due) { struct timespec ts = {0, (long)(due - now - 8000000)}; nanosleep(&ts, NULL); }
++    while ((now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW)) < due) {}
++    g_last_ns = now;
++    mtl_present_layer(t->d.width, t->d.height);   // the picture's shape is the source's (present_shape)
++    @autoreleasepool { g_last_ret = present_now(t, 1. / 60, 0, ++g_ticket, NULL, 0, nil, 0); g_bad_returns += g_last_ret != 0 && g_last_ret != 1; }
++}
++// The present queue's accounting (g_pq_mu): presents in flight on the GPU, the newest ticket done; an object in the residency set; nothing in flight within 5 s
++static int inflight(void) { pthread_mutex_lock(&g_pq_mu); int n = g_pq_inflight; pthread_mutex_unlock(&g_pq_mu); return n; }
++static uint64_t done_tk(void) { pthread_mutex_lock(&g_pq_mu); uint64_t d = g_pq_done; pthread_mutex_unlock(&g_pq_mu); return d; }
++static int resident(id o) { pthread_mutex_lock(&g_res_mu); int r = [g_res_objects containsObject:o]; pthread_mutex_unlock(&g_res_mu); return r; }
++static int settle(void) {
++    pthread_mutex_lock(&g_pq_mu); struct timespec ts; clock_gettime(CLOCK_REALTIME, &ts); ts.tv_sec += 5;
++    while (g_pq_inflight && pthread_cond_timedwait(&g_pq_cv, &g_pq_mu, &ts) != ETIMEDOUT) {}
++    int n = g_pq_inflight; pthread_mutex_unlock(&g_pq_mu); return n == 0;
++}
++static void drain_sink(void) { usleep(300000); while (!dispatch_semaphore_wait(g_fr_sem, DISPATCH_TIME_NOW)) {} }
++static void present(const tex_t *t) { present_at(t, g_last_ns + 1000000000ull / 60 + 200000); }   // the 60 fps cap never drops it
++static int present_wait(const tex_t *t) {   // the frame reached the sink within 2 s
++    present(t); return dispatch_semaphore_wait(g_fr_sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) == 0;
++}
++static int nal_type(const uint8_t *p) { return (p[0] >> 1) & 0x3f; }
++static int starts_with_ps(NSData *d) {   // VPS, SPS, PPS, each 4-byte length-prefixed
++    const uint8_t *p = d.bytes; size_t n = d.length, o = 0; static const int want[3] = {32, 33, 34};
++    for (int k = 0; k < 3; k++) { if (o + 5 > n) return 0; uint32_t l = (uint32_t)p[o] << 24 | p[o + 1] << 16 | p[o + 2] << 8 | p[o + 3]; if (nal_type(p + o + 4) != want[k]) return 0; o += 4 + l; }
++    return 1;
++}
++static size_t ps_len(const uint8_t *p) { size_t o = 0; for (int i = 0; i < 3; i++) o += 4 + ((uint32_t)p[o] << 24 | p[o + 1] << 16 | p[o + 2] << 8 | p[o + 3]); return o; }   // a key frame's VPS, SPS, PPS
++// Decodes the frames idx[0..n) in that order (the first a key frame), as a front end that never received the others, to BGRA and keeps the centre pixel of each.
++// Returns how many decoded before the first failed decode call or callback (n: all)
++static int decode_idx(const int *idx, int n, uint8_t centre[][4]) {
++    const uint8_t *ps[3]; size_t psn[3]; NSData *k = g_fr[idx[0]].d; const uint8_t *p = k.bytes; size_t o = 0;
++    for (int i = 0; i < 3; i++) { uint32_t l = (uint32_t)p[o] << 24 | p[o + 1] << 16 | p[o + 2] << 8 | p[o + 3]; ps[i] = p + o + 4; psn[i] = l; o += 4 + l; }
++    CMVideoFormatDescriptionRef fd = NULL;
++    if (CMVideoFormatDescriptionCreateFromHEVCParameterSets(NULL, 3, ps, psn, 4, NULL, &fd)) return 0;
++    NSDictionary *attrs = @{(id)kCVPixelBufferPixelFormatTypeKey: @(kCVPixelFormatType_32BGRA)};
++    VTDecompressionSessionRef ds = NULL;
++    if (VTDecompressionSessionCreate(NULL, fd, NULL, (__bridge CFDictionaryRef)attrs, NULL, &ds)) { CFRelease(fd); return 0; }
++    int ok = 1, i = 0;
++    for (; i < n && ok; i++) {
++        NSData *d = g_fr[idx[i]].d; size_t skip = 0;
++        if ((g_fr[idx[i]].fl & STREAM_FRAME_KEY)) skip = ps_len(d.bytes);   // the parameter sets are in the format description (one size: the same sets)
++        CMBlockBufferRef bb = NULL; CMSampleBufferRef sb = NULL; size_t len = d.length - skip;
++        CMBlockBufferCreateWithMemoryBlock(NULL, NULL, len, NULL, NULL, 0, len, kCMBlockBufferAssureMemoryNowFlag, &bb);
++        CMBlockBufferReplaceDataBytes((const uint8_t *)d.bytes + skip, bb, 0, len);
++        CMSampleBufferCreateReady(NULL, bb, fd, 1, 0, NULL, 1, &len, &sb);
++        __block int got = 0; uint8_t *c = centre[i];
++        OSStatus st = VTDecompressionSessionDecodeFrameWithOutputHandler(ds, sb, 0, NULL, ^(OSStatus s, VTDecodeInfoFlags f, CVImageBufferRef img, CMTime pts, CMTime dur) {
++            (void)f; (void)pts; (void)dur; if (s || !img) return;
++            CVPixelBufferLockBaseAddress(img, kCVPixelBufferLock_ReadOnly);
++            const uint8_t *b = CVPixelBufferGetBaseAddress(img); size_t bpr = CVPixelBufferGetBytesPerRow(img);
++            memcpy(c, b + CVPixelBufferGetHeight(img) / 2 * bpr + CVPixelBufferGetWidth(img) / 2 * 4, 4);
++            CVPixelBufferUnlockBaseAddress(img, kCVPixelBufferLock_ReadOnly); got = 1; });
++        VTDecompressionSessionWaitForAsynchronousFrames(ds);
++        ok = !st && got; CFRelease(sb); CFRelease(bb);
++        if (!ok) printf("frame %d (decoded %d of %d) did not decode: call %d, picture %d\n", idx[i], i, n, (int)st, got);
++    }
++    VTDecompressionSessionInvalidate(ds); CFRelease(ds); CFRelease(fd); return ok ? n : i - 1;
++}
++static int decode(int first, int n, uint8_t centre[][4]) { int idx[64]; for (int i = 0; i < n; i++) idx[i] = first + i; return decode_idx(idx, n, centre) == n; }
++static int near(const uint8_t bgra[4], int r, int g, int b) { return abs(bgra[2] - r) <= 12 && abs(bgra[1] - g) <= 12 && abs(bgra[0] - b) <= 12; }
++static int last(void) { return frames() - 1; }
++static void ack(int f) { if (g_fr[f].token >= 0) stream_video_ltr_ack(&g_fr[f].token, 1); }   // the front end decoded frame f
++// A key frame, then n frames of t, each acknowledged as it arrives (the front end decodes them all); returns the key frame's index
++static int key_then_acked(const tex_t *t, int n) {
++    stream_video_keyframe(); present_wait(t); int k = last();
++    for (int i = 0; i < n; i++) { ack(last()); present_wait(t); }
++    return k;
++}
++// The loss: frames k0..k decoded (k acknowledged), 4 frames of `lost` never reach the front end, then (with refresh) a refresh and 10 frames of `after`.
++// Fills idx with what the front end decodes and returns its count; *r is the first frame after the loss
++static int lose_four(int k0, const tex_t *lost, const tex_t *after, int refresh, int idx[], int *r) {
++    int n = 0; for (int f = k0; f <= last(); f++) idx[n++] = f;
++    ack(last()); for (int i = 0; i < 4; i++) present_wait(lost);
++    if (refresh) stream_video_refresh();
++    present_wait(after); *r = last(); for (int i = 0; i < 10; i++) present_wait(after);
++    for (int f = *r; f <= last(); f++) idx[n++] = f;
++    return n;
++}
++// Every frame from idx[from] on decodes to the colour (r, g, b)
++static int all_near(uint8_t c[][4], int from, int n, int r, int g, int b) { for (int i = from; i < n; i++) if (!near(c[i], r, g, b)) return 0; return 1; }
++static int keys_after(int f) { int k = 0; for (f++; f <= last(); f++) k += (g_fr[f].fl & STREAM_FRAME_KEY); return k; }   // one key frame serves a refresh: the encoder's own answer would need a second
++static int fl_count(int from, int to, int v) { int k = 0; for (int f = from; f <= to; f++) k += g_fr[f].fl == v; return k; }   // frames from..to whose flags byte is exactly v
++int main(void) { @autoreleasepool {
++    alarm(60); setbuf(stdout, NULL);
++    setenv("DM_STREAM", "test", 1);
++    mtl_init();
++    g_fr_sem = dispatch_semaphore_create(0); stream_video_set_sink(sink);
++    tex_t red = source(92001, 1920, 1080, 255, 0, 0), blue = source(92002, 1920, 1080, 0, 0, 255);
++    tex_t box = source(92003, 1440, 1080, 0, 255, 0), small = source(92004, 640, 360, 0, 255, 0), green = source(92005, 1920, 1080, 0, 255, 0);
++    char name[160];
++
++    present(&red); present(&red);
++    CHECK("no config: no frame reaches the sink", dispatch_semaphore_wait(g_fr_sem, dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC)) != 0 && frames() == 0);
++    CHECK("no config: the presents commit nothing and nothing counts in flight", inflight() == 0 && g_last_ret == 0);
++
++    stream_video_config(1280, 720, 60, 20000000);
++    int got = 0; for (int i = 0; i < 12; i++) got += present_wait(i < 6 ? &red : &blue);
++    snprintf(name, sizeof name, "12 presents give 12 frames (got %d)", got); CHECK(name, got == 12 && frames() == 12);
++    int keys = 0, sized = 0; for (int i = 0; i < 12 && i < g_nfr; i++) { keys += (g_fr[i].fl & STREAM_FRAME_KEY) << i; sized += g_fr[i].w == 1280 && g_fr[i].h == 720; }
++    CHECK("only the first frame is a key frame: flags 1, no other frame has a flag", keys == 1 && g_fr[0].fl == STREAM_FRAME_KEY && fl_count(1, 11, 0) == 11);
++    CHECK("each frame is 1280x720", sized == 12);
++    uint8_t centre[12][4] = {{0}};
++    int dec = g_nfr >= 12 && decode(0, 12, centre);
++    CHECK("the 12 frames decode", dec);
++    printf("frame 3 centre BGRA %u %u %u, frame 9 centre BGRA %u %u %u\n", centre[3][0], centre[3][1], centre[3][2], centre[9][0], centre[9][1], centre[9][2]);
++    CHECK("frame 3 is red", dec && near(centre[3], 255, 0, 0));
++    CHECK("frame 9 is blue", dec && near(centre[9], 0, 0, 255));
++    snprintf(name, sizeof name, "long-term references: the first frame carries a token (got %d)", g_fr[0].token); CHECK(name, g_fr[0].token >= 0);
++
++    stream_video_keyframe();
++    int n = frames(); got = present_wait(&red);
++    CHECK("stream_video_keyframe: the next frame is a key frame", got && (g_fr[n].fl & STREAM_FRAME_KEY) && g_fr[n].w == 1280);
++    CHECK("a key frame starts with VPS, SPS, PPS", got && starts_with_ps(g_fr[n].d));
++
++    n = frames(); got = present_wait(&small);
++    snprintf(name, sizeof name, "640x360 source: 640x360, never scaled up (got %dx%d)", got ? g_fr[n].w : 0, got ? g_fr[n].h : 0); CHECK(name, got && g_fr[n].w == 640 && g_fr[n].h == 360);
++    n = frames(); got = present_wait(&box);
++    snprintf(name, sizeof name, "1440x1080 source: 960x720 (got %dx%d)", got ? g_fr[n].w : 0, got ? g_fr[n].h : 0); CHECK(name, got && g_fr[n].w == 960 && g_fr[n].h == 720);
++
++    stream_video_config(640, 360, 60, 20000000);
++    n = frames(); got = present_wait(&red);
++    snprintf(name, sizeof name, "config 640x360: the next frame is a key frame of 640x360 (got %dx%d)", got ? g_fr[n].w : 0, got ? g_fr[n].h : 0);
++    CHECK(name, got && (g_fr[n].fl & STREAM_FRAME_KEY) && g_fr[n].w == 640 && g_fr[n].h == 360);
++
++    stream_video_config(1280, 720, 60, 20000000);
++    n = frames(); uint64_t due = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++    for (int i = 0; i < 60; i++) present_at(&red, due += i & 1 ? 14300000 : 19000000);
++    usleep(500000); while (!dispatch_semaphore_wait(g_fr_sem, DISPATCH_TIME_NOW)) {}
++    int jittered = frames() - n;
++    snprintf(name, sizeof name, "60 fps cap: 60 presents 19 and 14.3 ms apart give 60 frames (got %d)", jittered); CHECK(name, jittered == 60);
++
++    // a game on a 60 Hz grid whose one long frame presents 22 ms late, off the grid: the frames after it are back on the grid and none is refused
++    usleep(100000); n = frames(); due = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 20000000;
++    for (int i = 0; i < 30; i++) { if (i == 11) continue; present_at(&red, due + (uint64_t)i * 16666667 + (i == 10 ? 22000000 : 0)); }
++    usleep(500000); while (!dispatch_semaphore_wait(g_fr_sem, DISPATCH_TIME_NOW)) {}
++    int hitched = frames() - n;
++    snprintf(name, sizeof name, "60 fps cap: a present 22 ms late, then back on the 60 Hz grid: 29 presents give 29 frames (got %d)", hitched); CHECK(name, hitched == 29);
++
++    stream_video_config(1280, 720, 30, 20000000);
++    n = frames(); for (int i = 0; i < 60; i++) present(&red);
++    usleep(500000); while (!dispatch_semaphore_wait(g_fr_sem, DISPATCH_TIME_NOW)) {}
++    int capped = frames() - n;
++    snprintf(name, sizeof name, "30 fps cap: 60 presents at 60 fps give 28-32 frames (got %d)", capped); CHECK(name, capped >= 28 && capped <= 32);
++
++    // ---- long-term references ----
++    stream_video_config(1280, 720, 60, 20000000);
++    int k0 = key_then_acked(&red, 7), tok = 0; for (int f = k0 + 2; f <= last(); f++) tok += g_fr[f].token >= 0;
++    snprintf(name, sizeof name, "frames acknowledged as they arrive: each next frame carries a token (%d of %d)", tok, last() - k0 - 1); CHECK(name, tok == last() - k0 - 1);
++    // the decode proof: the front end decoded k0..k (red, acknowledged), lost 4 green frames, asked for a refresh; the refresh and the 10 frames after it (blue) must decode
++    int idx[64], r, nd = lose_four(k0, &green, &blue, 1, idx, &r); uint8_t c[64][4] = {{0}};
++    snprintf(name, sizeof name, "refresh after acknowledged frames: not a key frame (%d bytes)", (int)g_fr[r].d.length); CHECK(name, !(g_fr[r].fl & STREAM_FRAME_KEY));
++    snprintf(name, sizeof name, "refresh after acknowledged frames: flags 2 (repair frame), the frames before it and after it flags 0, the first frame flags 1 (refresh %d, flags %d)", r, g_fr[r].fl);
++    CHECK(name, g_fr[r].fl == STREAM_FRAME_REPAIR && g_fr[k0].fl == STREAM_FRAME_KEY && g_fr[0].fl == STREAM_FRAME_KEY && fl_count(k0 + 1, r - 1, 0) == r - k0 - 1 && fl_count(r + 1, last(), 0) == last() - r);
++    int ok = decode_idx(idx, nd, c), nr = nd - (last() - r + 1);
++    printf("refresh %d: centre BGRA %u %u %u, last %u %u %u\n", r, c[nr][0], c[nr][1], c[nr][2], c[nd - 1][0], c[nd - 1][1], c[nd - 1][2]);
++    snprintf(name, sizeof name, "decode proof: 4 frames lost, the refresh (not a key frame) and the 10 after it decode as presented (%d of %d decoded)", ok, nd);
++    CHECK(name, ok == nd && !(g_fr[r].fl & STREAM_FRAME_KEY) && all_near(c, 0, nr, 255, 0, 0) && all_near(c, nr, nd, 0, 0, 255));
++    // the control: the same loss without a refresh does not decode as presented
++    k0 = key_then_acked(&red, 7); nd = lose_four(k0, &green, &blue, 0, idx, &r); memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c); nr = nd - (last() - r + 1);
++    snprintf(name, sizeof name, "control: the same loss without a refresh does not decode as presented (%d of %d decoded)", ok, nd);
++    CHECK(name, ok < nd || !all_near(c, nr, nd, 0, 0, 255));
++    // nothing acknowledged since the last key frame (only before it): the tap asks for a key frame, and the frames after it decode
++    k0 = key_then_acked(&red, 3); stream_video_keyframe(); present_wait(&red); int k1 = last(); present_wait(&red); present_wait(&red);
++    stream_video_refresh(); present_wait(&blue); r = last(); for (int i = 0; i < 5; i++) present_wait(&blue);
++    nd = 0; for (int f = k1; f <= last(); f++) idx[nd++] = f; memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c);
++    snprintf(name, sizeof name, "refresh with nothing acknowledged since the key frame: a key frame, the 5 after it no key frame and all decode (%d of %d decoded, %d keys after)", ok, nd, keys_after(r));
++    CHECK(name, g_fr[r].fl == STREAM_FRAME_KEY && fl_count(k0, last(), STREAM_FRAME_REPAIR) == 0 && !keys_after(r) && ok == nd && all_near(c, nd - 6, nd, 0, 0, 255));   // the answer has flags 1; no frame of this test has flags 2
++    // a stale token (before the last key frame) and one never issued: frames still come out, and a refresh is a key frame that decodes with what follows
++    k0 = key_then_acked(&red, 3); int stale = g_fr[last()].token; stream_video_keyframe(); present_wait(&red); k1 = last();
++    int32_t bad[2] = {stale, 999999}; stream_video_ltr_ack(bad, 2); int out = 0; for (int i = 0; i < 3; i++) out += present_wait(&red);
++    stream_video_refresh(); out += present_wait(&blue); r = last(); for (int i = 0; i < 5; i++) out += present_wait(&blue);
++    nd = 0; for (int f = k1; f <= last(); f++) idx[nd++] = f; memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c);
++    snprintf(name, sizeof name, "a stale token (%d) and an unknown one: 9 frames come out (%d), the refresh is the only key frame after them, all decode (%d of %d, %d keys after)", stale, out, ok, nd, keys_after(r));
++    CHECK(name, stale >= 0 && out == 9 && (g_fr[r].fl & STREAM_FRAME_KEY) && !keys_after(r) && ok == nd && all_near(c, nd - 6, nd, 0, 0, 255));
++    // a new session (size change) forgets the old session's acknowledgements: its refresh is a key frame
++    k0 = key_then_acked(&red, 3); ack(last());
++    stream_video_config(640, 360, 60, 20000000); present_wait(&red); k1 = last(); present_wait(&red);
++    stream_video_refresh(); present_wait(&blue); r = last(); for (int i = 0; i < 5; i++) present_wait(&blue);
++    nd = 0; for (int f = k1; f <= last(); f++) idx[nd++] = f; memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c);
++    snprintf(name, sizeof name, "after a size change the old acknowledgements are gone: the refresh is a key frame, none after it, all decode (%d of %d, %d keys after)", ok, nd, keys_after(r));
++    CHECK(name, (g_fr[k1].fl & STREAM_FRAME_KEY) && g_fr[k1].w == 640 && (g_fr[r].fl & STREAM_FRAME_KEY) && !keys_after(r) && ok == nd && all_near(c, nd - 6, nd, 0, 0, 255));
++    // a bitrate change alone keeps the session: no key frame
++    stream_video_config(1280, 720, 60, 20000000); present_wait(&red); present_wait(&red);
++    stream_video_config(1280, 720, 60, 8000000); present_wait(&red);
++    CHECK("a bitrate change alone gives no key frame", g_fr[last()].w == 1280 && !(g_fr[last()].fl & STREAM_FRAME_KEY));
++
++    // a frame that carried acknowledgements fails to encode: the encoder never got them, so they go with a later frame and the refresh still predicts from one
++    stream_video_keyframe(); present_wait(&red); k1 = last(); for (int i = 0; i < 20 && g_fr[last()].token < 0; i++) present_wait(&red);
++    int ta = last(); ack(ta); stream_video_fault(STREAM_FAULT_ENCODE); present(&red);
++    int none = dispatch_semaphore_wait(g_fr_sem, dispatch_time(DISPATCH_TIME_NOW, 300 * NSEC_PER_MSEC)) != 0 && last() == ta;
++    stream_video_refresh(); present_wait(&blue); r = last(); for (int i = 0; i < 5; i++) present_wait(&blue);
++    nd = 0; for (int f = k1; f <= last(); f++) idx[nd++] = f; memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c);
++    snprintf(name, sizeof name, "acknowledgements on a frame that failed to encode: the refresh is not a key frame, none after it, all decode (token %d, %d of %d, %d keys after)", g_fr[ta].token, ok, nd, keys_after(r));
++    CHECK(name, g_fr[ta].token >= 0 && none && !(g_fr[r].fl & STREAM_FRAME_KEY) && !keys_after(r) && ok == nd && all_near(c, nd - 6, nd, 0, 0, 255));
++
++    // the same token acknowledged 40 times is harmless: the refresh after a loss still predicts from it and decodes
++    k0 = key_then_acked(&red, 4); for (int i = 0; i < 40; i++) ack(last());
++    nd = lose_four(k0, &green, &blue, 1, idx, &r); memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c); nr = nd - (last() - r + 1);
++    snprintf(name, sizeof name, "a token acknowledged 40 times: the refresh is not a key frame, all decode (%d of %d)", ok, nd);
++    CHECK(name, g_fr[last()].token >= 0 && !(g_fr[r].fl & STREAM_FRAME_KEY) && ok == nd && all_near(c, nr, nd, 0, 0, 255));
++
++    // two sessions in a row: their tokens on the wire never collide, and an acknowledgement from the old one never counts in the new one
++    stream_video_config(640, 360, 60, 20000000); int a0 = frames(); key_then_acked(&red, 6); int a1 = last();
++    stream_video_config(1280, 720, 60, 20000000); present_wait(&red); k1 = last(); for (int i = 0; i < 20 && g_fr[last()].token < 0; i++) present_wait(&red);
++    int same = 0, olde = -1, tb = g_fr[last()].token;
++    for (int i = a0; i <= a1; i++) { if (g_fr[i].token >= 0) olde = (int)((uint32_t)g_fr[i].token >> 24); for (int j = k1; j <= last(); j++) same += g_fr[i].token >= 0 && g_fr[i].token == g_fr[j].token; }
++    snprintf(name, sizeof name, "two sessions in a row: no token of the new one is a token of the old one (%d the same)", same); CHECK(name, olde >= 0 && tb >= 0 && !same);
++    int32_t cross = (int32_t)((uint32_t)olde << 24 | ((uint32_t)tb & 0xffffff)); stream_video_ltr_ack(&cross, 1);   // the old session's epoch, a value the new one issued
++    present_wait(&red); stream_video_refresh(); present_wait(&blue); r = last(); for (int i = 0; i < 5; i++) present_wait(&blue);
++    nd = 0; for (int f = k1; f <= last(); f++) idx[nd++] = f; memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c);
++    snprintf(name, sizeof name, "an acknowledgement of the old session (0x%08x) is dropped: the refresh is a key frame, none after it, all decode (%d of %d)", (unsigned)cross, ok, nd);
++    CHECK(name, (g_fr[r].fl & STREAM_FRAME_KEY) && !keys_after(r) && ok == nd && all_near(c, nd - 6, nd, 0, 0, 255));
++
++    // long-term references refused: no tokens, a refresh is a key frame, all decode
++    stream_video_fault(STREAM_FAULT_NO_LTR); stream_video_config(960, 540, 60, 20000000); present_wait(&red); k1 = last();
++    for (int i = 0; i < 16; i++) { ack(last()); present_wait(&red); }
++    int32_t any = 0; stream_video_ltr_ack(&any, 1); stream_video_refresh(); present_wait(&blue); r = last(); for (int i = 0; i < 5; i++) present_wait(&blue);
++    int toks = 0; for (int f = k1; f <= last(); f++) toks += g_fr[f].token != -1;
++    int repairs = fl_count(k1, last(), STREAM_FRAME_REPAIR);
++    nd = 0; for (int f = k1; f <= last(); f++) idx[nd++] = f; memset(c, 0, sizeof c); ok = decode_idx(idx, nd, c);
++    snprintf(name, sizeof name, "long-term references refused: every token -1 (%d not), the refresh is a key frame, all decode (%d of %d)", toks, ok, nd);
++    CHECK(name, g_fr[k1].w == 960 && !toks && !repairs && (g_fr[r].fl & STREAM_FRAME_KEY) && !keys_after(r) && ok == nd && all_near(c, nd - 6, nd, 0, 0, 255));
++    stream_video_fault(0);
++
++    // ---- a streamed present stays in flight until its commit completes, as a windowed one does (the present ticket, and a release of the presented image, wait for it) ----
++    stream_video_config(1280, 720, 60, 20000000); present_wait(&red); drain_sink();
++    snprintf(name, sizeof name, "settled: nothing in flight, the last ticket done (in flight %d, done %llu of %llu)", inflight(), (unsigned long long)done_tk(), (unsigned long long)g_ticket);
++    CHECK(name, settle() && done_tk() == g_ticket);
++    id<MTLSharedEvent> gate = [g_dev newSharedEvent];
++    [g_q4 waitForEvent:gate value:1];   // nothing committed to the Metal 4 queue from here runs until the gate opens
++    uint64_t before = g_ticket; n = frames(); int com = 0, drop = 0;
++    for (int i = 0; i < 4; i++) { present(&red); com += g_last_ret == 1; drop += g_last_ret == 0; }   // 3 slots: the 4th finds none free
++    snprintf(name, sizeof name, "queue held: 3 presents committed and in flight, the 4th dropped without counting (in flight %d, committed %d, dropped %d)", inflight(), com, drop);
++    CHECK(name, inflight() == 3 && com == 3 && drop == 1);
++    snprintf(name, sizeof name, "queue held: no held ticket is done (done %llu, first held %llu)", (unsigned long long)done_tk(), (unsigned long long)before + 1); CHECK(name, done_tk() == before);
++    gate.signaledValue = 1;
++    int sunk = 0; for (int i = 0; i < 3; i++) sunk += dispatch_semaphore_wait(g_fr_sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) == 0;
++    snprintf(name, sizeof name, "gate open: in flight 0, the 3 frames reach the sink, the newest committed ticket done (in flight %d, frames %d, done %llu of %llu)", inflight(), sunk, (unsigned long long)done_tk(), (unsigned long long)g_ticket - 1);
++    CHECK(name, settle() && sunk == 3 && frames() - n == 3 && done_tk() == g_ticket - 1);
++    snprintf(name, sizeof name, "front_metal_layer is never read by present_now (%d calls)", g_layer_calls); CHECK(name, g_layer_calls == 0);
++    // (from here mtl_present_ext queues a present, and the queue's link_sync asks whether there is a window)
++    // an external image (a Vulkan swapchain image, a GL window surface) presented through the present queue, its commit held, then released by its producer
++    drain_sink();
++    MTLTextureDescriptor *ed = [MTLTextureDescriptor texture2DDescriptorWithPixelFormat:MTLPixelFormatRGBA8Unorm width:1280 height:720 mipmapped:NO];
++    ed.storageMode = MTLStorageModeShared; ed.usage = MTLTextureUsageShaderRead;
++    id<MTLTexture> et = [g_dev newTextureWithDescriptor:ed]; uint64_t es = mtl_ext_tex((__bridge void *)et); res_commit();
++    pthread_mutex_lock(&g_pq_mu); g_ticket += 16; g_pq_in = g_pq_read = g_pq_done = g_ticket; pthread_mutex_unlock(&g_pq_mu);   // the present queue's tickets continue after the test's own
++    [g_q4 waitForEvent:gate value:2];
++    usleep(20000);   // past the cap's next due time
++    n = frames(); uint64_t tk = mtl_present_ext(es, 1. / 60, NULL, 0, NULL);
++    int handed = 0; for (int i = 0; i < 200 && !handed; i++) { pthread_mutex_lock(&g_pq_mu); handed = g_pq_read == tk && !g_classic_busy; pthread_mutex_unlock(&g_pq_mu); if (!handed) usleep(10000); }
++    snprintf(name, sizeof name, "queue held: the present thread handed ticket %llu on without waiting", (unsigned long long)tk); CHECK(name, handed);
++    snprintf(name, sizeof name, "queue held: ticket %llu in flight and not done (in flight %d, done %llu)", (unsigned long long)tk, inflight(), (unsigned long long)done_tk());
++    CHECK(name, inflight() == 1 && done_tk() < tk);
++    dispatch_semaphore_t rel = dispatch_semaphore_create(0);
++    dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INITIATED, 0), ^{ mtl_ext_tex_release(es); dispatch_semaphore_signal(rel); });
++    usleep(200000);
++    CHECK("queue held: the released image is still resident", resident(et));
++    gate.signaledValue = 2;
++    int released = dispatch_semaphore_wait(rel, dispatch_time(DISPATCH_TIME_NOW, 5 * NSEC_PER_SEC)) == 0, settled = settle();
++    sunk = dispatch_semaphore_wait(g_fr_sem, dispatch_time(DISPATCH_TIME_NOW, 2 * NSEC_PER_SEC)) == 0;
++    snprintf(name, sizeof name, "gate open: ticket %llu done, in flight 0, the release returned and the image left the residency set, its frame reached the sink (done %llu, in flight %d)", (unsigned long long)tk, (unsigned long long)done_tk(), inflight());
++    CHECK(name, released && settled && done_tk() == tk && !resident(et) && sunk && frames() - n == 1);
++
++    snprintf(name, sizeof name, "every present_now returned 0 or 1 (%d did not), nothing left in flight (%d)", g_bad_returns, inflight()); CHECK(name, g_bad_returns == 0 && settle());
++    printf("stream present: %d checks, %d failed\n", checks, failed); return failed != 0;
++} }
+diff --git a/dm/host/Makefile b/dm/host/Makefile
+index fea687b5aa23d66777fc846550fa358b5dc3bea8..3c3979eae3142e5d5c7792d2370ea3871f20ff4d 100644
+--- a/dm/host/Makefile
++++ b/dm/host/Makefile
+@@ -23,7 +23,7 @@ ifeq ($(filter -j%,$(MAKEFLAGS)),)
+ MAKEFLAGS += -j$(shell getconf _NPROCESSORS_ONLN 2>/dev/null || echo 4)
+ endif
+ # Service-layer takeover hle_*.c files are included by wildcard: adding a file does not touch this line (avoids merge conflicts)
+-SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m audio_input.c audio_input_mac.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m web_apple.m entry.S
++SRC=main.c loader.c hle.c crash.c probe.c thread.c save_sync.c memstat.m haptics_apple.m audio_input.c audio_input_mac.m pad_switch2_apple.m $(sort $(wildcard hle_*.c)) front_mac.m web_apple.m stream_video_mac.m stream_mac.c entry.S
+ # NVN null device + nn::vi + the Vulkan layer (dm/gfx/)
+ # Sources under dm/gfx, dm/gfx/nvn, dm/gfx/tex, dm/gfx/vk and dm/gfx/gl are included by wildcard (tests/ and metal/ do not go into the host): adding a file does not touch this line
+ GFX=$(sort $(wildcard ../gfx/*.c ../gfx/nvn/*.c ../gfx/nvn/*.m ../gfx/nvn/*.S ../gfx/tex/*.c ../gfx/tex/*.m ../gfx/vk/*.m ../gfx/gl/*.m))
+@@ -75,7 +75,7 @@ FORCE:
+ # lists the headers its source read (-MMD; -MP: a removed header is no error), so an edit rebuilds the objects that include it and the link; the Makefile (CFLAGS, these lines)
+ # rebuilds them all. The generated headers come first (order-only: the dependency files name them for the sources that read them). The NSP script builds gen/<id>/dmhost and takes it
+ HOST_CFLAGS = $(CFLAGS) -I../gfx/nvn/include -I$(dir $(MSL_H)) -I../third_party/vulkan-headers/include -I$(dir $(GAME_H)) -I$(VPX) -I$(DAV1D)/include -I../third_party/stb_vorbis -fobjc-arc
+-HOST_FRAMEWORKS = -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework CoreFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework ImageIO -framework UniformTypeIdentifiers
++HOST_FRAMEWORKS = -framework Cocoa -framework WebKit -framework UserNotifications -framework QuartzCore -framework Metal -framework MetalFX -framework GameController -framework CoreBluetooth -framework IOBluetooth -framework CoreHaptics -framework IOKit -framework AudioToolbox -framework CoreAudio -framework AVFAudio -framework CoreFoundation -framework VideoToolbox -framework CoreMedia -framework CoreVideo -framework IOSurface -framework ImageIO -framework UniformTypeIdentifiers
+ HOST_SRC = $(SRC) $(GFX)
+ ifneq ($(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))),)
+ $(error host sources outside dm/host and dm/gfx need an object rule: $(filter ../%,$(filter-out ../gfx/%,$(HOST_SRC))))
+diff --git a/dm/host/audio_input.c b/dm/host/audio_input.c
+index e9257588a2968e41d493704f8e27c0b290055d9f..988cc8b0a96ac7218c1b012532933a5c4d168ff4 100644
+--- a/dm/host/audio_input.c
++++ b/dm/host/audio_input.c
+@@ -1,4 +1,6 @@
+ #include "audio_input.h"
++#include "stream.h"   // stream_on: a streamed game opens no microphone
++#include <TargetConditionals.h>
+ #include <math.h>
+ #include <pthread.h>
+ #include <sched.h>
+@@ -90,7 +92,15 @@ static float dbfs(uint32_t peak, uint64_t squares, uint64_t samples, int rms) {
+ 
+ int dm_audio_input_available(void) {
+     const char *enabled = getenv("DM_MIC");
+-    return enabled && !strcmp(enabled, "1") && dm_audio_input_platform_device_available();
++    if (!enabled || strcmp(enabled, "1")) return 0;
++#if TARGET_OS_OSX
++    if (stream_on()) {   // DM_STREAM: never the Mac's microphone (the launcher turns DM_MIC off too; this is a host started without it)
++        static atomic_int told;
++        if (!atomic_exchange(&told, 1)) fprintf(stderr, "[RED] audio input: DM_STREAM: the microphone stays off (DM_MIC=1 was asked for)\n");
++        return 0;
++    }
++#endif
++    return dm_audio_input_platform_device_available();
+ }
+ 
+ void dm_audio_input_device_name(char out[DM_AUDIO_INPUT_NAME_SIZE]) {
+diff --git a/dm/host/dm.h b/dm/host/dm.h
+index fac7dfc8b96033bdb2d23018b72d61081840ff5e..bf87ccb120e39e45d6e9ff085dfc1e83a1737e1e 100644
+--- a/dm/host/dm.h
++++ b/dm/host/dm.h
+@@ -246,6 +246,10 @@ void dm_fstep_settle(void);   // hle_nvn.c: the window changed size, visibility,
+ void dm_gfx_quit(int wait_ms);   // hle_nvn.c: the process is ending (the graceful exit): what the pipeline archive has not written yet, written, waiting up to wait_ms
+ void dm_gfx_quit_begin(void);   // hle_nvn.c: the process is about to end (the graceful exit, oe::ExecuteProgram's hand-over): the pipeline prewarm stops and the archive starts writing what it holds, without waiting
+ enum { DM_QUIT_ARCH_MS = 10000 };   // what any end of the process the host controls gives the pipeline archive's write (atexit, the graceful exit): a file of 900 bases took 1.8-4 s on Macs
++// The graceful exit during the stream's prepare step (the Host's quit before the first frame) gives it this instead, so the process ends within 2 s (with EXIT_LATE_MS): the files
++// written so far are kept (each written whole, then renamed), the flush period under way is built again at the next start
++enum { DM_QUIT_PREPARE_MS = 1500 };
++int dm_gfx_quit_ms(void);   // hle_nvn.c: DM_QUIT_PREPARE_MS during the stream's prepare step, else DM_QUIT_ARCH_MS
+ void dm_gfx_enter(void); void dm_gfx_leave(void);   // hle_nvn.c: the gate dm_gfx_suspend closes, for graphics layers other than NVN (dm/gfx/vk)
+ void dm_gfx_shot_at(long k, const char *path);   // graphics side: screenshot of the k-th frame after the current presented frame (nvn_mtl.m)
+ void dm_shot_written(const char *path, int ok);   // The graphics side finished writing a screenshot to disk (diag.c: DM_TICK_HOLD=E:SHOT unfreezes on this)
+diff --git a/dm/host/front_mac.m b/dm/host/front_mac.m
+index 79eeefafd896144f31372bd42604c9b806c93712..639ca66cdd72e30dd6b52e31383d6c7b79b13092 100644
+--- a/dm/host/front_mac.m
++++ b/dm/host/front_mac.m
+@@ -19,6 +19,7 @@
+ #include "front.h"
+ #include "hle.h"
+ #include "pad_slots.h"
++#include "stream.h"
+ #include "haptics_apple.h"
+ #include "motion_apple.h"
+ #include "motion_pro_mac.h"
+@@ -1666,7 +1667,8 @@ void front_run(void (*guest)(void)) {
+     static id<NSObject> game_activity;
+     if (!game_activity)
+         game_activity = [NSProcessInfo.processInfo beginActivityWithOptions:NSActivityUserInitiated | NSActivityLatencyCritical reason:@"game"];
+-    if (!getenv("DM_WINDOW")) {
++    if (stream_on() || !getenv("DM_WINDOW")) {   // DM_STREAM runs windowless whatever DM_WINDOW says
++        if (stream_on() && stream_start(DM_GAME_ID, DM_GAME_NAME)) { LOG("[RED] stream: cannot reach the Host at %s", getenv("DM_STREAM")); exit(1); }
+         kern_return_t kr;
+         int role_status = front_windowless_role(getenv("DM_WINDOWLESS_ROLE"), &kr);
+         if (role_status > 0) LOG("front end: applied the default application task role for windowless play");
+diff --git a/dm/host/hle.h b/dm/host/hle.h
+index 37430fffb196c2af6b2dfb7fde0b62aa13f035df..eea66c67ab992a3f96bd69cc4cc6d44c973e9e6b 100644
+--- a/dm/host/hle.h
++++ b/dm/host/hle.h
+@@ -143,6 +143,7 @@ int dm_movie_hz(void);   // hle_movie.c: the picture rate of the movie playing (
+ void dm_movie_picture(const void *dec, const char *lib, int64_t ts_ns, int unknown_hz);   // hle_movie.c: video decoder dec (nn::movie's or nn::codec's) handed out a picture of this time; unknown_hz: its rate while the times give none
+ void dm_movie_stopped(const void *dec);   // hle_movie.c: dec was stopped or destroyed: its movie ends now
+ void dm_audio_suspend(int on);
++void dm_background(int on);   // hle_oe.c, Mac only: the background round trip (script_bg) and its reverse, for DM_STREAM's pause
+ uint64_t dm_audio_render_calls(void);   // Cumulative sound card callback count (the silent sink is not counted)
+ void dm_audio_reset(void);   // iOS media services reset: recreate the AudioUnits (hle_audio.c)
+ // nn::audio::AudioOutBuffer in the SDK's own layout, the audout service's buffer format (the same from SDK 8 to Switch 2's). The game fills and reads it through the SDK's own
+diff --git a/dm/host/hle_audio.c b/dm/host/hle_audio.c
+index 4919f5a23689483584ce60923cc1474dcb374471..7918803ead78f5b41d97002016beae6c7251f982 100644
+--- a/dm/host/hle_audio.c
++++ b/dm/host/hle_audio.c
+@@ -9,6 +9,10 @@
+ #include <dispatch/dispatch.h>
+ #include <stdatomic.h>
+ #include <unistd.h>
++#if TARGET_OS_OSX
++#include "stream.h"
++__attribute__((weak)) void stream_audio_pcm(const void *p, size_t n, int ch, int fold, const void *src) { (void)p; (void)n; (void)ch; (void)fold; (void)src; }   // stream_mac.c's replaces it in the host; unit tests that include this file do not link it
++#endif
+ #if TARGET_OS_IPHONE
+ int dm_ios_output_channels(void);   // front_ios.m: the audio session's output channel count
+ #endif
+@@ -448,6 +452,9 @@ static void *null_sink(void *p) {
+         t += 5000000; uint64_t now = now_ns();
+         if (t > now) usleep((useconds_t)((t - now) / 1000)); else if (now - t > 100000000) t = now;
+         pull(a, scratch, bytes);
++#if TARGET_OS_OSX
++        if (stream_on()) stream_audio_pcm(scratch, bytes, a->ch, a->sink_pcm, a);
++#endif
+     }
+     return NULL;
+ }
+@@ -463,7 +470,12 @@ static void au_halt(aout *a) {
+     }
+     a->stalled = 0; a->retry_ms = 0; a->retry_at = 0; a->route_until = 0;
+ }
+-static int real_audio(void) { const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE; }
++static int real_audio(void) {
++#if TARGET_OS_OSX
++    if (stream_on()) return 0;   // DM_STREAM: the silent sinks' blocks go to the streaming front end
++#endif
++    const char *e = getenv("DM_AUDIO"); return e ? atoi(e) != 0 : TARGET_OS_IPHONE;
++}
+ static void au_retry(aout *a, uint64_t now) {
+     a->stalled = 1;
+     a->retry_ms = a->retry_ms ? (a->retry_ms < 8000 ? a->retry_ms * 2 : 8000) : 1000;
+diff --git a/dm/host/hle_lifecycle.c b/dm/host/hle_lifecycle.c
+index 59e61f1eacfa33a1907a839d8071b3aacc472334..efaecac55c50a389ed8c815fbe0e1ce611c64a0b 100644
+--- a/dm/host/hle_lifecycle.c
++++ b/dm/host/hle_lifecycle.c
+@@ -1,7 +1,7 @@
+ // Host lifecycle: the graceful exit, for SIGTERM (a harness or `kill` ending a run) and oe::ExecuteProgram's hand-over to the next program (hle_oe.c). A player's quit (⌘Q, closing
+ // the window, exit()) is atexit's, and the iOS app has no termination callback: an iPhone ends the process only through the hand-over or without a word.
+ // In order: stop the background threads that write state (hlecount, DM_REC, cheats), pause audio, stop the pipeline prewarm and start the archive's write, drain graphics (at most
+-// EXIT_DRAIN_MS), wait for the archive's write within DM_QUIT_ARCH_MS of the start, the same time a quit gives it, then the continuation (then: execve of the next program) or _exit(0).
++// EXIT_DRAIN_MS), wait for the archive's write within DM_QUIT_ARCH_MS of the start, the same time a quit gives it (DM_QUIT_PREPARE_MS during the stream's prepare step), then the continuation (then: execve of the next program) or _exit(0).
+ // The default action also exits in about 0.08 s (exit code 143); the value of this function is that order, exit code 0, the pipelines the run compiled kept, and the next program.
+ #include "hle.h"
+ #include <dispatch/dispatch.h>
+@@ -22,10 +22,11 @@ static void exit_end(void (*then)(void *), void *arg) {
+ static int ms_left(uint64_t t0, int budget_ms) { int64_t left = budget_ms - (int64_t)((now_ns() - t0) / 1000000); return left > 0 ? (int)left : 0; }
+ void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) {
+     static _Atomic int once; if (atomic_exchange(&once, 1)) return;
+-    uint64_t t0 = now_ns(); LOG("received %s: graceful exit", why);
++    uint64_t t0 = now_ns(); int arch_ms = dm_gfx_quit_ms();   // the stream's prepare step: DM_QUIT_PREPARE_MS, the Host waits for the process
++    if (arch_ms != DM_QUIT_ARCH_MS) LOG("received %s: graceful exit during the stream's prepare step: the pipeline archive gets %.1f s", why, arch_ms / 1e3); else LOG("received %s: graceful exit", why);
+     // Past every wait below (something else stuck): end the process all the same, and start the next program if the exit has not, so a hand-over does not become a quit
+-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(DM_QUIT_ARCH_MS + EXIT_LATE_MS) * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
+-        LOG("[RED] graceful exit not done in %.1f seconds, exiting at once", (DM_QUIT_ARCH_MS + EXIT_LATE_MS) / 1e3); exit_end(then, arg); });
++    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(arch_ms + EXIT_LATE_MS) * NSEC_PER_MSEC), dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{
++        LOG("[RED] graceful exit not done in %.1f seconds, exiting at once", (arch_ms + EXIT_LATE_MS) / 1e3); exit_end(then, arg); });
+     hlecount_flush();                               // DM_HLECOUNT: _exit does not run atexit, write a copy here
+     dm_rec_finish();                                // DM_REC: the held state and the buffered steps (hle_hid.c)
+     dm_cheats_exit();                               // a clean exit: no safe mode for the cheats at the next launch (atexit does not run either)
+@@ -35,7 +36,7 @@ void dm_host_shutdown_then(const char *why, void (*then)(void *), void *arg) {
+     dispatch_async(dispatch_get_global_queue(QOS_CLASS_USER_INTERACTIVE, 0), ^{ dm_gfx_suspend(1); dispatch_semaphore_signal(drained); });
+     if (dispatch_semaphore_wait(drained, dispatch_time(DISPATCH_TIME_NOW, (int64_t)ms_left(t0, EXIT_DRAIN_MS) * NSEC_PER_MSEC)))
+         LOG("[RED] graceful exit: graphics not suspended in %.1f seconds (a draw under way, most often one compiling its pipeline): the pipeline archive is written all the same", EXIT_DRAIN_MS / 1e3);
+-    dm_gfx_quit(ms_left(t0, DM_QUIT_ARCH_MS));      // what the archive has not written yet, within the time a quit gives it
++    dm_gfx_quit(ms_left(t0, arch_ms));              // what the archive has not written yet, within the time a quit gives it
+     LOG("graceful exit done (%.3f s)", (now_ns() - t0) / 1e9);
+     exit_end(then, arg);
+ }
+diff --git a/dm/host/hle_oe.c b/dm/host/hle_oe.c
+index 188e415c0f984180279c0ad354ed1c0378970f86..4f2d7f967678efdb9a103b8a51bc5fdc385fe7c0 100644
+--- a/dm/host/hle_oe.c
++++ b/dm/host/hle_oe.c
+@@ -404,6 +404,9 @@ static void script_bg(int on) {
+     if (on) { dm_focus_set(2); dm_focus_set(3); dm_audio_suspend(1); guest_clock_freeze_for(1, 1); dm_gfx_suspend(1); }
+     else { dm_gfx_suspend(0); guest_clock_freeze_for(1, 0); dm_audio_suspend(0); dm_focus_set(2); dm_focus_set(1); }
+ }
++#if TARGET_OS_OSX
++void dm_background(int on) { script_bg(on); }   // the streaming front end's pause (stream_mac.c), on its reader thread as DM_OE_SCRIPT's thread calls it
++#endif
+ static void *oe_script(void *arg) {
+     char *buf = arg; uint64_t t0 = now_ns();
+     for (char *save, *tok = strtok_r(buf, ",", &save); tok; tok = strtok_r(NULL, ",", &save)) {
+diff --git a/dm/host/stream.h b/dm/host/stream.h
+new file mode 100644
+index 0000000000000000000000000000000000000000..9aa600c515cfb23315f51a8ad8cdeebf2005fbce
+--- /dev/null
++++ b/dm/host/stream.h
+@@ -0,0 +1,43 @@
++// DM_STREAM: the game runs with no window and each present is drawn into an IOSurface and encoded as HEVC for a streaming front end (stream_video_mac.m; nvn_mtl.m stream_present).
++// Mac only. The encoder is HEVC Main, low-latency rate control, no frame reordering, long-term references; key frames only at the start, on request, on a size change and for a
++// refresh with no frame acknowledged since the last key frame
++#pragma once
++#include <stddef.h>
++#include <stdint.h>
++#include <stdlib.h>
++#include <stdatomic.h>
++static inline int stream_on(void) { static _Atomic int on = -1; int v = atomic_load(&on); if (v < 0) { v = getenv("DM_STREAM") != NULL; atomic_store(&on, v); } return v; }   // read once, from any thread; here so either file links without the other
++void stream_video_config(int max_w, int max_h, int max_fps, int bitrate);   // any thread; the picture is scaled down to fit max_w x max_h, frames above max_fps dropped
++void stream_video_keyframe(void);   // the next frame is a key frame
++void stream_video_ltr_ack(const int32_t *tokens, int n);   // the front end decoded the frames that carried these tokens (the video message's token)
++void stream_video_refresh(void);   // the front end lost a frame: the next frame depends on nothing it may not have
++enum { STREAM_FAULT_ENCODE = 1, STREAM_FAULT_NO_LTR = 2 };   // for the test: the next encode fails as a refused VTCompressionSessionEncodeFrame; sessions made from now on run as if EnableLTR were refused
++void stream_video_fault(int faults);
++// An IOSurfaceRef (BGRA8, not retained for the caller) of the picture scaled down to the configured maximum (aspect kept, even dimensions, never up), or NULL: no config yet, the
++// frame-rate cap says skip, or all 3 slots are in flight. A NULL frame is dropped, never waited for. The slot is the caller's until stream_video_submit or stream_video_abort
++void *stream_video_surface(int pic_w, int pic_h, int *slot);
++void stream_video_submit(int slot, uint64_t capture_ns);   // the slot's GPU work is done: encode it (capture_ns: CLOCK_UPTIME_RAW)
++void stream_video_abort(int slot);   // the slot's GPU work failed: free it
++// flags: 0, STREAM_FRAME_KEY or STREAM_FRAME_REPAIR. data: 4-byte big-endian length-prefixed NAL units; a key frame starts with VPS, SPS, PPS. token: the frame's long-term reference token as sent ((session epoch << 24) | the encoder's token, opaque to the front end), -1 for none. Called on the encoder's thread
++#define STREAM_FRAME_KEY 1      // flags bit 0: a key frame
++#define STREAM_FRAME_REPAIR 2   // flags bit 1: a frame encoded with ForceLTRRefresh that came out as a non-key frame; never set with STREAM_FRAME_KEY (the value 3 is never sent)
++typedef void (*stream_frame_cb)(const uint8_t *data, size_t n, int flags, int32_t token, int w, int h, uint64_t capture_ns);
++void stream_video_set_sink(stream_frame_cb cb);
++
++// The tap socket (stream_mac.c). A layout change of any message bumps this on both sides (nxPortal CHANGELOG-protocol.md)
++#define STREAM_TAP_VERSION 2
++int stream_start(const char *title_id, const char *name);   // connects to the DM_STREAM path, sends the hello, starts the reader thread; 0 ok
++// One 5 ms block (240 frames) from one silent sink; the sources are mixed into one stereo stream, one audio message per push of the clock source (the first to push).
++// ch channels as the sink holds them; has_fold: the last two are the sink's pre-clamped stereo fold. source: any pointer that tells the sinks apart
++void stream_audio_pcm(const void *pcm16, size_t bytes, int ch, int has_fold, const void *source);
++void stream_audio_pcm_at(const void *pcm16, size_t bytes, int ch, int has_fold, const void *source, uint64_t now);   // stream_audio_pcm with the time given (CLOCK_UPTIME_RAW ns): for the test
++extern void (*stream_quit_hook)(void);   // called once when the stream ends (quit, closed socket, bad message); default: a graceful exit through SIGTERM. Tests replace it
++// The prepare step before the first frame (nvn_mtl.m warm_start: the prewarm lists' pipelines, then the shader pairs' prebuild), told to the Host in prepare messages. Between begin
++// and end no video or audio message is sent (a frame encoded meanwhile is dropped and the next one is a key frame). stream_prepare: sent when a phase starts, at most every 250 ms
++// while it runs, and once with done == total when it ends; a call that sends nothing returns at once. stream_prepare_at: the same with the time given (CLOCK_UPTIME_RAW ns): for the test
++enum { STREAM_PREPARE_LISTS = 1, STREAM_PREPARE_PAIRS = 2 };
++int stream_prepare_wanted(void);   // connected to the Host and DM_STREAM_PREPARE is not 0: the game prepares before its first frame (else in the background while playing)
++void stream_prepare_begin(void);
++void stream_prepare(int phase, long done, long total);
++void stream_prepare_at(int phase, long done, long total, uint64_t now);
++void stream_prepare_end(void);
+diff --git a/dm/host/stream_mac.c b/dm/host/stream_mac.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..755ad9d80dd5c7dcc4d520ecd8a0dba91a44c52f
+--- /dev/null
++++ b/dm/host/stream_mac.c
+@@ -0,0 +1,227 @@
++// DM_STREAM tap socket (Mac only): the host connects to the streaming front end's Unix socket, sends the encoded video (stream_video_mac.m) and the game's sound, and takes the controllers,
++// pause and quit from it. Messages: u32 little-endian length of (type + payload), u8 type, payload; every integer little-endian, fields packed (docs/frontends.md, Streaming front ends).
++// One reader thread; writes are whole messages under one lock (the encoder's thread and the sound threads both write). Anything that ends the stream calls stream_quit_hook once
++#include <errno.h>
++#include <pthread.h>
++#include <signal.h>
++#include <stdatomic.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/uio.h>
++#include <sys/un.h>
++#include <time.h>
++#include <unistd.h>
++#include "dm.h"
++#include "dm_input.h"
++#include "stream.h"
++
++void dm_background(int on);   // hle.h: the background sequence and its reverse
++
++enum { T_HELLO = 1, T_VIDEO = 2, T_AUDIO = 3, T_PREPARE = 4, T_CONFIG = 0x10, T_KEYFRAME, T_PAD, T_MOTION, T_PLAYERS, T_PAUSE, T_QUIT, T_MOTION_CLEAR, T_LTR_ACK, T_REFRESH };
++enum { MAX_MSG = 8 << 20, FRAMES = 240, MAX_SRC = 16, FORGET_NS = 100000000, MAX_ACK = 16 };
++
++static int g_fd = -1;
++static pthread_mutex_t g_wmu = PTHREAD_MUTEX_INITIALIZER;   // one message at a time on the socket; guards g_frame
++static pthread_t g_reader; static int g_reader_up;
++static uint32_t g_frame;
++static _Atomic int g_quit;
++
++// A graceful exit through the host's SIGTERM path (hle_lifecycle.c dm_host_shutdown: stops the writers, drains graphics, then _exit(0)); the process-directed kill reaches its signal source from any thread
++static void quit_default(void) { kill(getpid(), SIGTERM); }
++void (*stream_quit_hook)(void) = quit_default;
++static void quit_once(void) { if (!atomic_exchange(&g_quit, 1)) stream_quit_hook(); }
++
++static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
++static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
++static unsigned get16(const uint8_t *p) { return p[0] | p[1] << 8; }
++static uint32_t get32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
++static uint64_t get64(const uint8_t *p) { return get32(p) | (uint64_t)get32(p + 4) << 32; }
++static float getf(const uint8_t *p) { uint32_t u = get32(p); float f; memcpy(&f, &u, 4); return f; }
++
++// One message: head (an bytes) then body (bn bytes) after the length and type; 0 ok, -1 failed. Callers hold g_wmu
++static int send_locked(int type, const void *a, size_t an, const void *b, size_t bn) {
++    uint8_t h[5]; put32(h, (uint32_t)(1 + an + bn)); h[4] = (uint8_t)type;
++    struct iovec iov[3] = {{h, 5}, {(void *)a, an}, {(void *)b, bn}}, *v = iov; int nv = 3;
++    while (nv) {
++        if (!v->iov_len) { v++; nv--; continue; }
++        ssize_t k = g_fd < 0 ? -1 : writev(g_fd, v, nv);
++        if (k < 0) { if (errno == EINTR) continue; return -1; }
++        while (k && nv) { if ((size_t)k >= v->iov_len) { k -= (ssize_t)v->iov_len; v++; nv--; } else { v->iov_base = (char *)v->iov_base + k; v->iov_len -= (size_t)k; k = 0; } }
++    }
++    return 0;
++}
++
++static _Atomic int g_preparing, g_prep_dropped;   // between stream_prepare_begin and _end (the prepare step below); a frame was dropped meanwhile
++static void video_sink(const uint8_t *d, size_t n, int flags, int32_t token, int w, int h, uint64_t capture_ns) {
++    if (atomic_load(&g_preparing)) { atomic_store(&g_prep_dropped, 1); return; }   // the prepare step: no video until it ends, and no frame number used
++    if (n > MAX_MSG - 22) {   // its number is used, so the front end sees the gap
++        LOG("[RED] stream: a %zu-byte frame is over the message limit: dropped", n);
++        pthread_mutex_lock(&g_wmu); g_frame++; pthread_mutex_unlock(&g_wmu); stream_video_keyframe(); return;
++    }
++    uint8_t hd[21]; put64(hd + 4, capture_ns); put16(hd + 12, (unsigned)w); put16(hd + 14, (unsigned)h); hd[16] = (uint8_t)flags; put32(hd + 17, (uint32_t)token);
++    pthread_mutex_lock(&g_wmu);
++    put32(hd, g_frame);
++    int r = send_locked(T_VIDEO, hd, sizeof hd, d, n);
++    if (!r) g_frame++;
++    pthread_mutex_unlock(&g_wmu);
++    if (r) quit_once();
++}
++
++// ---- sound: every silent sink pushes its 5 ms block; the first source to push is the clock and each of its pushes emits one stereo message, with at most one queued block from each other source ----
++typedef struct { const void *key; uint64_t last; int queued; int16_t pcm[FRAMES * 2]; } src_t;
++static src_t g_src[MAX_SRC]; static int g_clock = -1;
++static pthread_mutex_t g_mix = PTHREAD_MUTEX_INITIALIZER;
++static int16_t sat16(int32_t v) { return (int16_t)(v > 32767 ? 32767 : v < -32768 ? -32768 : v); }
++
++// n frames of ch channels to stereo: 2 as is; a fold (the sink's six channels, then their stereo fold) the last two; 6 and 8 without one mixed at 0.7071 (front, centre, surround; LFE dropped); 1 doubled
++static void to_stereo(int16_t *o, const int16_t *s, int n, int ch, int fold) {
++    const float k = 0.7071f;
++    for (int i = 0; i < n; i++, s += ch) {
++        float l, r;
++        if (fold && ch >= 3) { l = s[ch - 2]; r = s[ch - 1]; }
++        else if (ch == 1) l = r = s[0];
++        else if (ch == 6) { l = s[0] + k * (s[2] + s[4]); r = s[1] + k * (s[2] + s[5]); }
++        else if (ch == 8) { l = s[0] + k * (s[2] + s[4] + s[6]); r = s[1] + k * (s[2] + s[5] + s[7]); }
++        else { l = s[0]; r = s[1]; }
++        *o++ = sat16((int32_t)l); *o++ = sat16((int32_t)r);
++    }
++}
++
++void stream_audio_pcm(const void *pcm16, size_t bytes, int ch, int has_fold, const void *source) {
++    stream_audio_pcm_at(pcm16, bytes, ch, has_fold, source, clock_gettime_nsec_np(CLOCK_UPTIME_RAW));
++}
++void stream_audio_pcm_at(const void *pcm16, size_t bytes, int ch, int has_fold, const void *source, uint64_t now) {
++    if (!pcm16 || ch < 1 || g_fd < 0 || atomic_load(&g_preparing)) return;   // the prepare step: no audio until it ends. now was read before the lock: another thread may have stored a later last, so a source is forgotten only when last < now
++    int n = (int)(bytes / (2 * (size_t)ch)); if (n > FRAMES) n = FRAMES;
++    int16_t blk[FRAMES * 2] = {0}; to_stereo(blk, pcm16, n, ch, has_fold);
++    pthread_mutex_lock(&g_mix);
++    int me = -1, free_i = -1;
++    for (int i = 0; i < MAX_SRC; i++) {
++        src_t *s = &g_src[i];
++        if (s->key && s->key != source && s->last < now && now - s->last > FORGET_NS) { s->key = NULL; s->queued = 0; if (g_clock == i) g_clock = -1; }
++        if (s->key == source) me = i; else if (!s->key && free_i < 0) free_i = i;
++    }
++    if (me < 0) { if (free_i < 0) { pthread_mutex_unlock(&g_mix); return; } me = free_i; g_src[me].key = source; g_src[me].queued = 0; }
++    g_src[me].last = now;
++    if (g_clock < 0) g_clock = me;
++    if (g_clock != me) { memcpy(g_src[me].pcm, blk, sizeof blk); g_src[me].queued = 1; pthread_mutex_unlock(&g_mix); return; }
++    int32_t acc[FRAMES * 2]; for (int i = 0; i < FRAMES * 2; i++) acc[i] = blk[i];
++    for (int j = 0; j < MAX_SRC; j++) if (j != me && g_src[j].key && g_src[j].queued) { for (int i = 0; i < FRAMES * 2; i++) acc[i] += g_src[j].pcm[i]; g_src[j].queued = 0; }
++    pthread_mutex_unlock(&g_mix);
++    uint8_t hd[9]; put64(hd, now); hd[8] = 2;
++    int16_t out[FRAMES * 2]; for (int i = 0; i < FRAMES * 2; i++) out[i] = sat16(acc[i]);   // stereo int16 in the host's (little-endian) byte order
++    pthread_mutex_lock(&g_wmu);
++    int r = send_locked(T_AUDIO, hd, sizeof hd, out, sizeof out);
++    pthread_mutex_unlock(&g_wmu);
++    if (r) quit_once();
++}
++
++// ---- the prepare step: the prepare message (phase 1, done 4, total 4); video and audio held back until it ends ----
++static int g_prep_phase, g_prep_ended; static uint64_t g_prep_last;   // under g_wmu: the phase last sent, its end sent, when the last message went
++int stream_prepare_wanted(void) {
++    const char *e = getenv("DM_STREAM_PREPARE");
++    return g_fd >= 0 && !atomic_load(&g_quit) && !(e && !strcmp(e, "0"));
++}
++void stream_prepare_begin(void) {
++    pthread_mutex_lock(&g_wmu); g_prep_phase = 0; g_prep_ended = 0; pthread_mutex_unlock(&g_wmu);
++    atomic_store(&g_prep_dropped, 0); atomic_store(&g_preparing, 1);
++}
++void stream_prepare(int phase, long done, long total) { stream_prepare_at(phase, done, total, clock_gettime_nsec_np(CLOCK_UPTIME_RAW)); }
++void stream_prepare_at(int phase, long done, long total, uint64_t now) {
++    if (g_fd < 0 || !atomic_load(&g_preparing) || phase < 1 || phase > 255) return;
++    if (total < 0) total = 0;
++    if (total > 0xffffffffL) total = 0xffffffffL;
++    if (done < 0) done = 0;
++    if (done > total) done = total;
++    pthread_mutex_lock(&g_wmu);
++    int start = phase != g_prep_phase, end = done == total;
++    if (!start && (g_prep_ended || (!end && now - g_prep_last < 250000000ull))) { pthread_mutex_unlock(&g_wmu); return; }   // at most 4 a second, the end once
++    uint8_t pl[9]; pl[0] = (uint8_t)phase; put32(pl + 1, (uint32_t)done); put32(pl + 5, (uint32_t)total);
++    int r = send_locked(T_PREPARE, pl, sizeof pl, NULL, 0);
++    g_prep_phase = phase; g_prep_ended = end; g_prep_last = now;
++    pthread_mutex_unlock(&g_wmu);
++    if (r) quit_once();
++}
++void stream_prepare_end(void) {
++    if (!atomic_exchange(&g_preparing, 0)) return;
++    if (atomic_exchange(&g_prep_dropped, 0)) stream_video_keyframe();   // the Host has seen nothing yet: the next frame starts the picture
++}
++
++// ---- reader ----
++static int read_all(int fd, void *p, size_t n) {
++    while (n) { ssize_t k = read(fd, p, n); if (k < 0 && errno == EINTR) continue; if (k <= 0) return -1; p = (char *)p + k; n -= (size_t)k; }
++    return 0;
++}
++// One message; -1 ends the stream. Every legal message from the front end is at most 66 bytes (an ltrAck of 16 tokens)
++static int handle(int type, const uint8_t *p, size_t n) {
++    static int paused, seen_cfg, seen_pad;
++    switch (type) {
++    case T_CONFIG:
++        if (n != 9) return -1;
++        if (!seen_cfg) { seen_cfg = 1; LOG("stream: first config %ux%u %u fps %u bit/s", get16(p), get16(p + 2), p[4], get32(p + 5)); }
++        stream_video_config(get16(p), get16(p + 2), p[4], (int)(get32(p + 5) > 0x7fffffffu ? 0x7fffffffu : get32(p + 5)));
++        return 0;
++    case T_KEYFRAME: if (n) return -1; stream_video_keyframe(); return 0;
++    case T_PAD: {
++        if (n != 25) return -1;
++        uint64_t b = get64(p + 1); int32_t ax[4]; for (int i = 0; i < 4; i++) ax[i] = (int32_t)get32(p + 9 + 4 * i);
++        if (b && !seen_pad) { seen_pad = 1; LOG("stream: first pad input (player %u, buttons 0x%llx)", p[0], (unsigned long long)b); }
++        if (p[0] == 0) dm_pad_set(b, ax[0], ax[1], ax[2], ax[3]);
++        else if (p[0] < DM_PLAYERS) dm_pad_set_player(p[0], b, ax[0], ax[1], ax[2], ax[3]);
++        return 0; }
++    case T_MOTION: {
++        if (n != 26) return -1;
++        float acc[3], rot[3]; for (int i = 0; i < 3; i++) { acc[i] = getf(p + 2 + 4 * i); rot[i] = getf(p + 14 + 4 * i); }
++        if (p[0] >= DM_PLAYERS) return 0;
++        if (p[1] == 1) { if (p[0] == 0) dm_motion_set_switch(0, acc, rot); }
++        else if (p[1] == 0) dm_motion_set(p[0], acc, rot);
++        return 0; }
++    case T_PLAYERS: if (n != 4) return -1; dm_pad_players(get32(p)); return 0;
++    case T_PAUSE:
++        if (n != 1) return -1;
++        if ((p[0] != 0) != paused) { paused = p[0] != 0; LOG("stream: %s", paused ? "paused" : "resumed"); dm_background(paused); }
++        return 0;
++    case T_MOTION_CLEAR: if (n != 1) return -1; if (p[0] < DM_PLAYERS) dm_motion_clear(p[0]); return 0;
++    case T_LTR_ACK: {
++        if (n < 1 || !p[0] || p[0] > MAX_ACK || n != 1 + 4 * (size_t)p[0]) return -1;
++        int32_t t[MAX_ACK]; for (int i = 0; i < p[0]; i++) t[i] = (int32_t)get32(p + 1 + 4 * i);
++        stream_video_ltr_ack(t, p[0]); return 0; }
++    case T_REFRESH: if (n) return -1; stream_video_refresh(); return 0;
++    default: return -1;   // quit, or a type this side does not know
++    }
++}
++static void *reader(void *arg) {
++    int fd = (int)(intptr_t)arg; uint8_t h[4], m[72];
++    for (;;) {
++        if (read_all(fd, h, 4)) break;
++        uint32_t len = get32(h);
++        if (len < 1 || len > MAX_MSG || len > sizeof m || read_all(fd, m, len)) break;   // m[0] is the type
++        if (handle(m[0], m + 1, len - 1)) break;
++    }
++    quit_once();
++    return NULL;
++}
++
++int stream_start(const char *title_id, const char *name) {
++    const char *path = getenv("DM_STREAM");
++    struct sockaddr_un sa = {.sun_family = AF_UNIX};
++    if (!path || !*path || strlen(path) >= sizeof sa.sun_path) { LOG("[RED] stream: DM_STREAM is not a usable socket path"); return -1; }
++    strcpy(sa.sun_path, path);
++    int fd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (fd < 0) { LOG("[RED] stream: socket failed: %s", strerror(errno)); return -1; }
++    int one = 1, buf = 4 << 20; setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof one); setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof buf);
++    if (connect(fd, (struct sockaddr *)&sa, sizeof sa)) { LOG("[RED] stream: cannot connect to %s: %s", path, strerror(errno)); close(fd); return -1; }
++    if (g_reader_up) { pthread_join(g_reader, NULL); g_reader_up = 0; }   // a restart (the test): the previous reader has ended
++    if (g_fd >= 0) close(g_fd);
++    g_fd = fd; g_frame = 0; atomic_store(&g_quit, 0); atomic_store(&g_preparing, 0);
++    size_t nl = strlen(name); if (nl > 65535) { nl = 65535; while (nl && ((unsigned char)name[nl] & 0xC0) == 0x80) nl--; }   // cut on a character boundary
++    uint8_t hd[20] = {0}; put16(hd, STREAM_TAP_VERSION); memcpy(hd + 2, title_id, strnlen(title_id, 16)); put16(hd + 18, (unsigned)nl);
++    pthread_mutex_lock(&g_wmu); int r = send_locked(T_HELLO, hd, sizeof hd, name, nl); pthread_mutex_unlock(&g_wmu);
++    if (r) { LOG("[RED] stream: the hello could not be written: %s", strerror(errno)); return -1; }
++    stream_video_set_sink(video_sink);
++    LOG("stream: connected to the Host (tap protocol %d)", STREAM_TAP_VERSION);
++    if (pthread_create(&g_reader, NULL, reader, (void *)(intptr_t)fd)) { LOG("[RED] stream: cannot start the reader thread"); return -1; }
++    g_reader_up = 1;
++    return 0;
++}
+diff --git a/dm/host/stream_video_mac.m b/dm/host/stream_video_mac.m
+new file mode 100644
+index 0000000000000000000000000000000000000000..e7f75ad625c92616e74d342c3fbd45fab70d3ca6
+--- /dev/null
++++ b/dm/host/stream_video_mac.m
+@@ -0,0 +1,208 @@
++// DM_STREAM video (stream.h): three IOSurface slots the present pass draws into (nvn_mtl.m stream_present), encoded as HEVC by VideoToolbox and handed to the sink.
++// A slot is busy from stream_video_surface until the encoder's output callback (or an abort, a drop); slot state and the config are under g_mu, the session under g_enc_mu
++// (taken before g_mu, never inside it: the output callback takes g_mu while the encode thread waits for it in VTCompressionSessionCompleteFrames).
++// Long-term references: a frame may carry a token; the front end acknowledges the tokens of frames it decoded, and after a loss asks for a refresh, a frame predicted only from an
++// acknowledged frame. Found on this encoder (HEVC, low-latency rate control): ForceLTRRefresh with no usable acknowledged frame gives a key frame whose next frames do not decode
++// (kVTVideoDecoderBadDataErr -12909, on a decoder given every frame); an acknowledgement of a token from before a key frame is no usable frame for it, one never issued is ignored.
++// So the tap passes only tokens issued since the last key frame and asks for a key frame itself when the encoder holds no acknowledgement since then.
++// A token on the wire is (epoch << 24) | the encoder's token: the epoch (7 bits) moves on with every session, whose tokens start again at 0, so an acknowledgement from an older session never matches
++#import <Foundation/Foundation.h>
++#import <VideoToolbox/VideoToolbox.h>
++#import <CoreVideo/CoreVideo.h>
++#include <stdatomic.h>
++#include "dm.h"
++#include "stream.h"
++
++enum { SLOTS = 3 };
++static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER, g_enc_mu = PTHREAD_MUTEX_INITIALIZER;
++static int g_max_w, g_max_h, g_max_fps, g_rate, g_key;   // under g_mu; g_max_w 0 = no config yet; g_key: the next frame encoded is a key frame
++static uint64_t g_due_ns, g_sent_ns;   // under g_mu: when the frame-rate cap's schedule expects the next frame, the newest frame handed to the encoder (the order)
++static int g_presents, g_over_cap, g_no_slot, g_ref_p, g_ref_key;   // under g_mu: this window of 600 presents, the frames the cap refused, those no free slot took, refreshes served as non-key and as key frames
++enum { ISSUED = 64, PEND = 32 };
++// Under g_mu: the session has long-term references; a refresh is asked for; a frame that carried acknowledgements came out of the encoder since the last key frame (the encoder holds them);
++// key frames handed to the encoder whose output has not come (the frames output before them are older than them); key frames and refreshes in flight (each repairs any loss before it); the epoch
++static int g_ltr, g_refresh, g_acked, g_key_wait, g_fix_wait, g_epoch, g_nissued, g_npend;
++static int32_t g_issued[ISSUED], g_pend[PEND];   // under g_mu: the newest encoder tokens issued since the session's last key frame (the only ones the encoder can refer to); acknowledged ones not yet passed
++static struct { CVPixelBufferRef pb; int w, h, busy, nack, repair; int32_t ack[PEND]; } g_slot[SLOTS];   // under g_mu; ack: the acknowledgements the slot's frame carries to the encoder; repair: the slot's frame was encoded with ForceLTRRefresh
++static VTCompressionSessionRef g_vt; static int g_vt_w, g_vt_h, g_vt_fps, g_vt_rate;   // under g_enc_mu
++static _Atomic(stream_frame_cb) g_sink;
++static _Atomic int g_fault;   // stream_video_fault (the test)
++void stream_video_fault(int faults) { atomic_store(&g_fault, faults); }
++
++void stream_video_set_sink(stream_frame_cb cb) { atomic_store(&g_sink, cb); }
++void stream_video_config(int max_w, int max_h, int max_fps, int bitrate) {
++    pthread_mutex_lock(&g_mu); g_max_w = max_w > 1 ? max_w : 0; g_max_h = max_h; g_max_fps = max_fps > 0 ? max_fps : 60; g_rate = bitrate; pthread_mutex_unlock(&g_mu);
++}
++void stream_video_keyframe(void) { pthread_mutex_lock(&g_mu); g_key = 1; pthread_mutex_unlock(&g_mu); }
++static int has(const int32_t *a, int n, int32_t t) { for (int i = 0; i < n; i++) if (a[i] == t) return 1; return 0; }
++// A token is kept only when it is of this session's epoch and the session issued it since its last key frame (a stale, unknown or older session's one is dropped), once; the newest PEND go with the next frame
++void stream_video_ltr_ack(const int32_t *tokens, int n) {
++    pthread_mutex_lock(&g_mu);
++    for (int i = 0; i < n && g_ltr; i++) {
++        int32_t t = tokens[i] & 0xffffff;
++        if (tokens[i] < 0 || tokens[i] >> 24 != g_epoch || !has(g_issued, g_nissued, t) || has(g_pend, g_npend, t)) continue;
++        if (g_npend == PEND) { memmove(g_pend, g_pend + 1, sizeof *g_pend * (PEND - 1)); g_npend--; }
++        g_pend[g_npend++] = t;
++    }
++    pthread_mutex_unlock(&g_mu);
++}
++// Under g_mu: the acknowledgements of a frame the encoder may not have taken go again with the next frame, ahead of newer ones (one the encoder took twice is harmless)
++static void ack_restore(const int32_t *a, int n) {
++    for (int i = n - 1; i >= 0 && g_npend < PEND; i--) if (has(g_issued, g_nissued, a[i]) && !has(g_pend, g_npend, a[i])) { memmove(g_pend + 1, g_pend, sizeof *g_pend * g_npend); g_pend[0] = a[i]; g_npend++; }
++}
++// A refresh while a key frame or a refresh is in the encoder is that one's: the loss it reports came before it (the loss of the repair frame itself is seen only after its output)
++void stream_video_refresh(void) { pthread_mutex_lock(&g_mu); if (!g_fix_wait) g_refresh = 1; pthread_mutex_unlock(&g_mu); }
++void stream_video_abort(int slot) { if (slot >= 0 && slot < SLOTS) { pthread_mutex_lock(&g_mu); g_slot[slot].busy = 0; pthread_mutex_unlock(&g_mu); } }
++// The picture scaled down to fit the maximum, aspect kept, never up, even dimensions (4:2:0)
++static void fit(int pw, int ph, int mw, int mh, int *w, int *h) {
++    if (pw <= mw && ph <= mh) { *w = pw; *h = ph; }
++    else if ((int64_t)pw * mh >= (int64_t)ph * mw) { *w = mw; *h = (int)((int64_t)ph * mw / pw); }
++    else { *h = mh; *w = (int)((int64_t)pw * mh / ph); }
++    *w = *w & ~1 ? *w & ~1 : 2; *h = *h & ~1 ? *h & ~1 : 2;
++}
++void *stream_video_surface(int pic_w, int pic_h, int *slot) {
++    uint64_t now = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), per; void *s = NULL; int i = 0, w, h, log_n = 0, log_a = 0, log_b = 0, log_c = 0, log_d = 0;
++    pthread_mutex_lock(&g_mu);
++    if (!g_max_w || pic_w <= 0 || pic_h <= 0) goto out;
++    per = 1000000000ull / g_max_fps;
++    if (++g_presents == 600) {
++        if (g_over_cap || g_no_slot || g_ref_p || g_ref_key) { log_n = g_presents; log_a = g_over_cap; log_b = g_no_slot; log_c = g_ref_p; log_d = g_ref_key; }
++        g_presents = g_over_cap = g_no_slot = g_ref_p = g_ref_key = 0;
++    }
++    // the cap keeps a schedule, not the last arrival: a frame is refused only when more than a quarter period early, so a game at the cap's rate keeps every frame through its jitter;
++    // a frame a period or more late leaves the next one due at once, so the frames after a long one, back on the game's own rhythm, are kept (the rate over any two periods stays within the cap plus one frame)
++    if (g_due_ns && now + per / 4 < g_due_ns) { g_over_cap++; goto out; }
++    while (i < SLOTS && g_slot[i].busy) i++;
++    if (i == SLOTS) { g_no_slot++; goto out; }   // every slot in flight: dropped, the present thread never waits
++    fit(pic_w, pic_h, g_max_w, g_max_h, &w, &h);
++    if (!g_slot[i].pb || g_slot[i].w != w || g_slot[i].h != h) {
++        CVPixelBufferRelease(g_slot[i].pb); g_slot[i].pb = NULL;
++        NSDictionary *a = @{(id)kCVPixelBufferIOSurfacePropertiesKey: @{}, (id)kCVPixelBufferMetalCompatibilityKey: @YES};
++        CVReturn r = CVPixelBufferCreate(NULL, w, h, kCVPixelFormatType_32BGRA, (__bridge CFDictionaryRef)a, &g_slot[i].pb);
++        if (r) { LOG("[RED] stream: CVPixelBufferCreate %dx%d failed: %d", w, h, r); g_slot[i].pb = NULL; goto out; }
++        g_slot[i].w = w; g_slot[i].h = h;
++    }
++    g_slot[i].busy = 1; g_due_ns = !g_due_ns ? now + per : now < g_due_ns + per ? g_due_ns + per : now; *slot = i; s = CVPixelBufferGetIOSurface(g_slot[i].pb);
++out:
++    pthread_mutex_unlock(&g_mu);
++    if (log_n) {
++        char rc[96] = "", rk[64] = "";
++        if (log_c) snprintf(rc, sizeof rc, ", %d refreshes as non-key frames", log_c);
++        if (log_d) snprintf(rk, sizeof rk, ", %d refreshes as key frames", log_d);
++        LOG("stream: %d presents, %d over the cap, %d no free slot%s%s", log_n, log_a, log_b, rc, rk);
++    }
++    return s;
++}
++static OSStatus vt_set(CFStringRef k, CFTypeRef v) {   // under g_enc_mu
++    OSStatus st = VTSessionSetProperty(g_vt, k, v);
++    if (st) LOG("[RED] stream: VTSessionSetProperty %s failed: %d", [(__bridge NSString *)k UTF8String], (int)st);
++    return st;
++}
++// Output: the sample's NAL units as they come (4-byte length prefixes), a key frame's VPS, SPS and PPS from the format description first
++static void enc_out(void *ref, void *src, OSStatus st, VTEncodeInfoFlags fl, CMSampleBufferRef sb) {
++    (void)ref; intptr_t tag = (intptr_t)src; int i = (int)(tag & 0xff) - 1, forced = tag >> 8 & 1, refresh = tag >> 9 & 1;   // the refcon: slot + 1, bit 8 set for a frame that was to be a key frame, bit 9 for one that serves a refresh
++    int out_ok = !st && sb && !(fl & kVTEncodeInfo_FrameDropped), key = 0; int flags; int32_t token = -1, wire = -1; static int big_logged;
++    if (out_ok) {
++        CFArrayRef at = CMSampleBufferGetSampleAttachmentsArray(sb, false);
++        CFDictionaryRef a0 = at && CFArrayGetCount(at) ? CFArrayGetValueAtIndex(at, 0) : NULL;
++        key = !(a0 && CFDictionaryContainsKey(a0, kCMSampleAttachmentKey_NotSync));
++        CFNumberRef tn = a0 ? CFDictionaryGetValue(a0, kVTSampleAttachmentKey_RequireLTRAcknowledgementToken) : NULL;
++        if (tn && (!CFNumberGetValue(tn, kCFNumberSInt32Type, &token) || token < 0)) token = -1;
++        if (token > 0xffffff) { if (!big_logged++) LOG("[RED] stream: long-term reference token %d does not fit 24 bits: sent as none", (int)token); token = -1; }
++    }
++    pthread_mutex_lock(&g_mu);   // one section with the slot's release: its acknowledgements are read before the slot can be taken again; before the sink, as the front end may acknowledge at once
++    g_slot[i].busy = 0; g_key |= !!st || (forced && !out_ok); g_refresh |= !st && refresh && !out_ok;   // a lost key frame or refresh is asked for again
++    g_key_wait -= forced; g_fix_wait -= forced || refresh;
++    if (!st && !out_ok) ack_restore(g_slot[i].ack, g_slot[i].nack);   // dropped: the encoder may not have taken them
++    if (out_ok) {
++        if (key) g_nissued = g_npend = g_acked = 0;   // a key frame ends every reference before it
++        else if (g_slot[i].nack && !g_key_wait) g_acked = 1;
++        if (token >= 0 && !g_key_wait) { if (g_nissued == ISSUED) { memmove(g_issued, g_issued + 1, sizeof *g_issued * (ISSUED - 1)); g_nissued--; } g_issued[g_nissued++] = token; }
++        if (token >= 0) wire = g_epoch << 24 | token;
++        if (refresh) { if (key) g_ref_key++; else g_ref_p++; }
++    }
++    flags = key ? STREAM_FRAME_KEY : out_ok && g_slot[i].repair ? STREAM_FRAME_REPAIR : 0;   // the mark follows the frame that was encoded with the option (its slot), and only when the encoder made a non-key frame of it
++    g_slot[i].repair = 0;
++    g_slot[i].nack = 0;
++    pthread_mutex_unlock(&g_mu);
++    if (st) { LOG("[RED] stream: HEVC encode failed: %d", (int)st); return; }
++    stream_frame_cb cb = atomic_load(&g_sink);
++    if (!cb || !out_ok) return;
++    if (refresh && key && !forced) { LOG("[RED] stream: the encoder answered a long-term reference refresh with a key frame: asking for another key frame"); stream_video_keyframe(); }   // the frames after such a key frame do not decode
++    CMFormatDescriptionRef fd = CMSampleBufferGetFormatDescription(sb); CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(fd);
++    CMBlockBufferRef bb = CMSampleBufferGetDataBuffer(sb); size_t n = CMBlockBufferGetDataLength(bb), psn = 0, cnt = 0;
++    const uint8_t *ps[8]; size_t pl[8];
++    if (key) {
++        int hl = 0;
++        if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, 0, NULL, NULL, &cnt, &hl) || hl != 4) { LOG("[RED] stream: no HEVC parameter sets (length size %d)", hl); stream_video_keyframe(); return; }
++        for (size_t k = 0; k < cnt && k < 8; k++) {
++            if (CMVideoFormatDescriptionGetHEVCParameterSetAtIndex(fd, k, &ps[k], &pl[k], NULL, NULL)) { LOG("[RED] stream: HEVC parameter set %zu unreadable", k); stream_video_keyframe(); return; }
++            psn += 4 + pl[k];
++        }
++    }
++    uint8_t *out = malloc(psn + n), *o = out;
++    if (!out) { LOG("[RED] stream: no memory for a %zu-byte frame", psn + n); stream_video_keyframe(); return; }
++    for (size_t k = 0; key && k < cnt && k < 8; k++) { uint32_t l = (uint32_t)pl[k]; *o++ = l >> 24; *o++ = l >> 16; *o++ = l >> 8; *o++ = l; memcpy(o, ps[k], l); o += l; }
++    if (CMBlockBufferCopyDataBytes(bb, 0, n, o)) { LOG("[RED] stream: frame data unreadable"); stream_video_keyframe(); }
++    else cb(out, psn + n, flags, wire, dim.width, dim.height, (uint64_t)CMSampleBufferGetPresentationTimeStamp(sb).value);
++    free(out);
++}
++// The session for w x h, made again only when the size changes (its first frame a key frame); rate and frame rate follow the config. Under g_enc_mu
++static int enc_session(int w, int h, int fps, int rate, int *key) {
++    if (g_vt && (w != g_vt_w || h != g_vt_h)) {   // the old session's frames reach the sink first
++        VTCompressionSessionCompleteFrames(g_vt, kCMTimeInvalid); VTCompressionSessionInvalidate(g_vt); CFRelease(g_vt); g_vt = NULL;
++    }
++    if (!g_vt) {
++        NSDictionary *spec = @{(id)kVTVideoEncoderSpecification_EnableLowLatencyRateControl: @YES};
++        OSStatus st = VTCompressionSessionCreate(NULL, w, h, kCMVideoCodecType_HEVC, (__bridge CFDictionaryRef)spec, NULL, NULL, enc_out, NULL, &g_vt);
++        if (st) { LOG("[RED] stream: VTCompressionSessionCreate HEVC %dx%d failed: %d", w, h, (int)st); g_vt = NULL; return 0; }
++        vt_set(kVTCompressionPropertyKey_ProfileLevel, kVTProfileLevel_HEVC_Main_AutoLevel);
++        vt_set(kVTCompressionPropertyKey_RealTime, kCFBooleanTrue);
++        vt_set(kVTCompressionPropertyKey_AllowFrameReordering, kCFBooleanFalse);
++        vt_set(kVTCompressionPropertyKey_MaxKeyFrameInterval, (__bridge CFNumberRef)@(INT32_MAX));
++        int ltr = atomic_load(&g_fault) & STREAM_FAULT_NO_LTR ? (LOG("[RED] stream: VTSessionSetProperty EnableLTR failed: %d (test)", (int)kVTPropertyNotSupportedErr), 0) : !vt_set(kVTCompressionPropertyKey_EnableLTR, kCFBooleanTrue);   // off for this session when refused: tokens -1, a refresh is a key frame
++        pthread_mutex_lock(&g_mu); g_ltr = ltr; g_nissued = g_npend = g_acked = g_key_wait = g_fix_wait = 0; g_epoch = (g_epoch + 1) & 127; pthread_mutex_unlock(&g_mu);   // the old session's tokens mean nothing to this one
++        g_vt_w = w; g_vt_h = h; g_vt_fps = g_vt_rate = 0; *key = 1;
++        LOG("stream: HEVC %dx%d", w, h);
++        if (ltr) LOG("stream: long-term references on");
++    }
++    if (rate != g_vt_rate) { vt_set(kVTCompressionPropertyKey_AverageBitRate, (__bridge CFNumberRef)@(rate)); g_vt_rate = rate; }
++    if (fps != g_vt_fps) { vt_set(kVTCompressionPropertyKey_ExpectedFrameRate, (__bridge CFNumberRef)@(fps)); g_vt_fps = fps; }
++    return 1;
++}
++// Frames are encoded in the order they were presented: one older than a frame already sent (its GPU work finished later) is dropped
++void stream_video_submit(int slot, uint64_t capture_ns) { @autoreleasepool {
++    if (slot < 0 || slot >= SLOTS) return;
++    pthread_mutex_lock(&g_enc_mu); pthread_mutex_lock(&g_mu);
++    int late = capture_ns <= g_sent_ns, key = g_key, refresh = g_refresh, w = g_slot[slot].w, h = g_slot[slot].h, fps = g_max_fps, rate = g_rate; CVPixelBufferRef pb = g_slot[slot].pb;
++    if (late) g_slot[slot].busy = 0; else { g_sent_ns = capture_ns; g_key = g_refresh = 0; }
++    pthread_mutex_unlock(&g_mu);
++    if (!late) {
++        OSStatus st = -1; int ltr_ref = 0, made = 0, na = 0; int32_t ack[PEND];
++        if (enc_session(w, h, fps, rate, &key)) {   // a new session (key set) has no acknowledged token
++            made = 1;
++            pthread_mutex_lock(&g_mu);
++            na = key ? 0 : g_npend; memcpy(ack, g_pend, sizeof *ack * na); memcpy(g_slot[slot].ack, ack, sizeof *ack * na); g_slot[slot].nack = na; g_npend = 0;
++            // the encoder holds an acknowledgement since the last key frame, or this frame carries one (a refresh predicts from it in the same frame); else a key frame, decided here (see the top)
++            ltr_ref = refresh && !key && g_ltr && (g_acked || na); key |= refresh && !ltr_ref;
++            if (key) { g_nissued = g_acked = 0; g_key_wait++; }   // no token from before this key frame is acknowledged from here on
++            g_fix_wait += key || refresh;
++            g_slot[slot].repair = ltr_ref;   // read by enc_out for this frame
++            pthread_mutex_unlock(&g_mu);
++            NSMutableDictionary *fp = key || na || ltr_ref ? [NSMutableDictionary dictionary] : nil;
++            if (key) fp[(id)kVTEncodeFrameOptionKey_ForceKeyFrame] = @YES;
++            if (na) { NSMutableArray *a = [NSMutableArray arrayWithCapacity:na]; for (int i = 0; i < na; i++) [a addObject:@(ack[i])]; fp[(id)kVTEncodeFrameOptionKey_AcknowledgedLTRTokens] = a; }
++            if (ltr_ref) fp[(id)kVTEncodeFrameOptionKey_ForceLTRRefresh] = @YES;
++            st = atomic_fetch_and(&g_fault, ~STREAM_FAULT_ENCODE) & STREAM_FAULT_ENCODE ? kVTParameterErr : VTCompressionSessionEncodeFrame(g_vt, pb, CMTimeMake((int64_t)capture_ns, 1000000000), kCMTimeInvalid, (__bridge CFDictionaryRef)fp,
++                                                 (void *)(intptr_t)(slot + 1 + (key ? 0x100 : 0) + (refresh ? 0x200 : 0)), NULL);
++            if (st) LOG("[RED] stream: VTCompressionSessionEncodeFrame failed: %d", (int)st);
++        }
++        if (st) {   // no output callback comes for it: its acknowledgements go with the next frame
++            pthread_mutex_lock(&g_mu);
++            if (made) { g_key_wait -= key; g_fix_wait -= key || refresh; g_slot[slot].nack = 0; g_slot[slot].repair = 0; ack_restore(ack, na); }
++            g_slot[slot].busy = 0; g_key |= key; g_refresh |= refresh && !key;
++            pthread_mutex_unlock(&g_mu);
++        }
++    }
++    pthread_mutex_unlock(&g_enc_mu);
++} }
+diff --git a/dm/host/tests/Makefile b/dm/host/tests/Makefile
+index 39cd8e7cdefe54de79453b155cd9b362e6f6c338..4a931678c959bd00472404914b65b84f93cc34dc 100644
+--- a/dm/host/tests/Makefile
++++ b/dm/host/tests/Makefile
+@@ -12,7 +12,7 @@ QUIET = $(if $(findstring -fsanitize,$(SAN)),,2>/dev/null)
+ GINC = $(if $(strip $(GAME)),-I../gen/$(GAME) -I../../games/$(GAME),$(error GAME is not set: make GAME=<base game title ID>: $(shell python3 ../../games/game.py list | awk -F'\t' '{printf "%s (%s)  ", $$1, $$3}')))
+ $(B)/t_fs $(B)/t_fs_case $(B)/t_fs_commit_list $(B)/t_fs_commit_list_tsan: ../romfs_image.h
+ GAME_H = ../gen/$(GAME)/game_profile.h
+-run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_friends $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_audren_sv $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2
++run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_size $(B)/t_touch $(B)/t_gesture $(B)/t_oe $(B)/t_friends $(B)/t_fs $(B)/t_fs_commit_list $(B)/t_thread_leak $(B)/t_fs_case $(B)/t_audio $(B)/t_output_stream $(B)/t_audio_spsc $(B)/t_swkbd $(B)/t_altstack $(B)/t_condvar $(B)/t_condvar_old $(B)/t_pollwait $(B)/t_clockwait $(B)/t_pause $(B)/t_pause_stress $(B)/t_pctl $(B)/t_sf $(B)/t_audren_sv $(B)/t_time $(B)/t_shared_font $(B)/t_vorbis $(B)/t_vorbis_divides $(B)/t_hid $(B)/t_haptics $(B)/t_haptics_apple $(B)/t_cheats $(B)/t_pad_hid $(B)/t_switch2 $(B)/t_stream
+ 	$(B)/t_language
+ 	$(B)/t_heap_size
+ 	$(B)/t_touch
+@@ -47,6 +47,7 @@ run: $(B)/t_mii $(B)/t_net_eventfd $(B)/t_language $(B)/t_motion $(B)/t_heap_siz
+ 	$(B)/t_preempt
+ 	$(B)/t_preempt --all-peers
+ 	$(B)/t_pause
++	$(B)/t_stream
+ 	$(B)/t_pause_stress --seconds 1
+ 	$(B)/t_pctl
+ 	$(B)/t_net_eventfd
+@@ -217,11 +218,12 @@ audio-device: $(B)/t_audio_device
+ run: audio-device
+ $(B)/t_audio_spsc_tsan: t_audio_spsc.c ../hle_audio.c $(AUDIO_INPUT_DEPS) ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -g -O1 -fsanitize=thread -Wno-unused-function -I.. $(GINC) -o $@ t_audio_spsc.c ../hle_bigstack.c $(AUDIO_INPUT_STUB) -framework AudioToolbox -framework CoreAudio -framework CoreFoundation
+-$(B)/t_audio_input: t_audio_input.c ../audio_input.c ../audio_input.h | $(B)
++$(B)/t_audio_input: t_audio_input.c ../audio_input.c ../audio_input.h ../stream.h | $(B)
+ 	$(CLANG) -O1 -g -Wall -Werror -I.. -o $@ t_audio_input.c
+ .PHONY: audio-input
+ audio-input: $(B)/t_audio_input
+ 	$(B)/t_audio_input
++	DM_STREAM=1 $(B)/t_audio_input --stream
+ run: audio-input
+ run: $(B)/t_fpslock
+ $(B)/t_fpslock: t_fpslock.c ../hle_fpslock.c ../hle.h ../dm.h $(GAME_H) | $(B)
+@@ -319,6 +321,8 @@ $(B)/t_pad_hid_mac: t_pad_hid_mac.m ../pad_hid_mac.h ../pad_hid.h ../pad_pro.h .
+ 	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_pad_hid_mac.m -framework Foundation -framework GameController -framework IOKit
+ $(B)/t_motion_pro_mac: t_motion_pro_mac.m ../motion_pro_mac.h ../motion_pro.h ../dm_input.h | $(B)
+ 	$(CLANG) -O1 -g -fobjc-arc -Wall -Werror -Wno-unused-function -fsanitize=address,undefined -I.. -o $@ t_motion_pro_mac.m -framework Foundation -framework GameController -framework IOKit
++$(B)/t_stream: t_stream.c ../stream_mac.c ../stream.h ../dm.h ../dm_input.h $(GAME_H) | $(B)
++	$(CLANG) -O1 -g -Wall -Werror -I.. $(GINC) -o $@ t_stream.c ../stream_mac.c
+ $(B)/t_hid: t_hid.c ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+ 	$(CLANG) -O1 -Wall -Werror -Wno-unused-function -I.. $(GINC) -o $@ t_hid.c ../hle_haptics.c ../hle_bigstack.c
+ $(B)/t_hid_tsan: t_hid.c ../hle_hid.c ../motion_fusion.h ../hle_haptics.c ../hle_haptics.h ../pad_slots.h ../dm_input.h ../hle_bigstack.c ../hle.h ../dm.h $(GAME_H) | $(B)
+diff --git a/dm/host/tests/t_audio_input.c b/dm/host/tests/t_audio_input.c
+index e665f6a53e8aaa35807a70d42fe19fb1047aa4f1..7dbe2c82aa4802a227c698faa5f45cbe9ae3d671 100644
+--- a/dm/host/tests/t_audio_input.c
++++ b/dm/host/tests/t_audio_input.c
+@@ -1,4 +1,5 @@
+ #include "../audio_input.c"
++#include "../stream.h"
+ #include <assert.h>
+ #include <math.h>
+ #include <stdio.h>
+@@ -183,7 +184,21 @@ static void test_route_recovery(void) {
+     assert(starts == before + 3);
+ }
+ 
+-int main(void) {
++// DM_STREAM (set by the Makefile for this run): a streamed game never opens the Mac's microphone, whatever DM_MIC says
++static void test_stream_keeps_the_microphone_off(void) {
++    assert(setenv("DM_MIC", "1", 1) == 0 && stream_on());
++    assert(!dm_audio_input_available());
++    assert(!dm_audio_input_open(DM_AUDIO_INPUT_PCM16, 1, 48000, 8));
++    assert(prepares == 0 && starts == 0);   // no device was asked for
++}
++
++int main(int argc, char **argv) {
++    if (argc == 2 && !strcmp(argv[1], "--stream")) {
++        test_stream_keeps_the_microphone_off();
++        puts("audio input with DM_STREAM: microphone off, no device opened: PASS");
++        return 0;
++    }
++    assert(!stream_on());
+     assert(setenv("DM_MIC", "1", 1) == 0);
+     assert(setenv("DM_MIC_GAIN", "1", 1) == 0);
+     test_fanout_and_polling();
+diff --git a/dm/host/tests/t_stream.c b/dm/host/tests/t_stream.c
+new file mode 100644
+index 0000000000000000000000000000000000000000..e794b2372c53b3280277f87847c61a6622dad236
+--- /dev/null
++++ b/dm/host/tests/t_stream.c
+@@ -0,0 +1,359 @@
++// DM_STREAM tap (stream_mac.c): a Unix socket listener plays the streaming front end. Checks the hello, input and pause messages mapped to the dm_* calls, the sound mix (one audio message per push
++// of the clock source), the video message, the prepare messages, and the single quit on a bad length, a quit message or a closed socket. The dm_* and stream_video_* functions are stubs
++// that record their arguments
++#include <errno.h>
++#include <poll.h>
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <sys/socket.h>
++#include <sys/un.h>
++#include <unistd.h>
++#include "dm_input.h"
++#include "stream.h"
++
++int stream_start(const char *title_id, const char *name);
++void stream_audio_pcm(const void *pcm16, size_t bytes, int ch, int has_fold, const void *source);
++extern void (*stream_quit_hook)(void);
++
++#define CHECK(c, msg) do { checks++; if (!(c)) { fails++; fprintf(stderr, "FAIL: %s (line %d)\n", msg, __LINE__); } } while (0)
++static int checks, fails;
++
++// ---- stubs: each records what the reader thread called ----
++static pthread_mutex_t g_mu = PTHREAD_MUTEX_INITIALIZER;
++static struct { int n, player; uint64_t buttons; int32_t ax[4]; } g_pad, g_padp;   // dm_pad_set (player 0), dm_pad_set_player
++static struct { int n, player; float acc[3], rot[3]; } g_msw, g_mot;   // dm_motion_set_switch, dm_motion_set
++static int g_mclear_n, g_mclear_player, g_players_n; static uint32_t g_players;
++static int g_cfg_n, g_cfg[4], g_key_n, g_bg_n, g_bg_seq[8], g_quit_n, g_ack_n, g_ack_count, g_refresh_n; static int32_t g_ack[16];
++static stream_frame_cb g_sink;
++void dm_pad_set(uint64_t b, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { pthread_mutex_lock(&g_mu); g_pad.n++; g_pad.buttons = b; g_pad.ax[0] = lx; g_pad.ax[1] = ly; g_pad.ax[2] = rx; g_pad.ax[3] = ry; pthread_mutex_unlock(&g_mu); }
++void dm_pad_set_player(int p, uint64_t b, int32_t lx, int32_t ly, int32_t rx, int32_t ry) { pthread_mutex_lock(&g_mu); g_padp.n++; g_padp.player = p; g_padp.buttons = b; g_padp.ax[0] = lx; g_padp.ax[1] = ly; g_padp.ax[2] = rx; g_padp.ax[3] = ry; pthread_mutex_unlock(&g_mu); }
++void dm_pad_players(uint32_t m) { pthread_mutex_lock(&g_mu); g_players_n++; g_players = m; pthread_mutex_unlock(&g_mu); }
++void dm_motion_set_switch(int p, const float a[3], const float r[3]) { pthread_mutex_lock(&g_mu); g_msw.n++; g_msw.player = p; memcpy(g_msw.acc, a, 12); memcpy(g_msw.rot, r, 12); pthread_mutex_unlock(&g_mu); }
++void dm_motion_set(int p, const float a[3], const float r[3]) { pthread_mutex_lock(&g_mu); g_mot.n++; g_mot.player = p; memcpy(g_mot.acc, a, 12); memcpy(g_mot.rot, r, 12); pthread_mutex_unlock(&g_mu); }
++void dm_motion_clear(int p) { pthread_mutex_lock(&g_mu); g_mclear_n++; g_mclear_player = p; pthread_mutex_unlock(&g_mu); }
++void dm_background(int on) { pthread_mutex_lock(&g_mu); if (g_bg_n < 8) g_bg_seq[g_bg_n] = on; g_bg_n++; pthread_mutex_unlock(&g_mu); }
++void stream_video_config(int w, int h, int fps, int br) { pthread_mutex_lock(&g_mu); g_cfg_n++; g_cfg[0] = w; g_cfg[1] = h; g_cfg[2] = fps; g_cfg[3] = br; pthread_mutex_unlock(&g_mu); }
++void stream_video_keyframe(void) { pthread_mutex_lock(&g_mu); g_key_n++; pthread_mutex_unlock(&g_mu); }
++void stream_video_ltr_ack(const int32_t *t, int n) { pthread_mutex_lock(&g_mu); g_ack_n++; g_ack_count = n; for (int i = 0; i < n && i < 16; i++) g_ack[i] = t[i]; pthread_mutex_unlock(&g_mu); }
++void stream_video_refresh(void) { pthread_mutex_lock(&g_mu); g_refresh_n++; pthread_mutex_unlock(&g_mu); }
++void stream_video_set_sink(stream_frame_cb cb) { g_sink = cb; }
++static void test_quit(void) { pthread_mutex_lock(&g_mu); g_quit_n++; pthread_mutex_unlock(&g_mu); }
++
++// Waits (at most 2 s) until *v >= want, read under the stubs' lock
++static int wait_ge(const int *v, int want) {
++    for (int i = 0; i < 2000; i++) { pthread_mutex_lock(&g_mu); int ok = *v >= want; pthread_mutex_unlock(&g_mu); if (ok) return 1; usleep(1000); }
++    return 0;
++}
++static int get(const int *v) { pthread_mutex_lock(&g_mu); int r = *v; pthread_mutex_unlock(&g_mu); return r; }
++
++// ---- the front end's side ----
++static char g_dir[64], g_path[96];
++static int g_lfd = -1, g_cfd = -1;
++static void listen_on(void) {
++    struct sockaddr_un sa = {.sun_family = AF_UNIX}; strncpy(sa.sun_path, g_path, sizeof sa.sun_path - 1);
++    unlink(g_path); g_lfd = socket(AF_UNIX, SOCK_STREAM, 0);
++    if (g_lfd < 0 || bind(g_lfd, (struct sockaddr *)&sa, sizeof sa) || listen(g_lfd, 1)) { perror("listen"); exit(2); }
++}
++static void put16(uint8_t *p, unsigned v) { p[0] = (uint8_t)v; p[1] = (uint8_t)(v >> 8); }
++static void put32(uint8_t *p, uint32_t v) { for (int i = 0; i < 4; i++) p[i] = (uint8_t)(v >> (8 * i)); }
++static void put64(uint8_t *p, uint64_t v) { for (int i = 0; i < 8; i++) p[i] = (uint8_t)(v >> (8 * i)); }
++static void putf(uint8_t *p, float f) { uint32_t u; memcpy(&u, &f, 4); put32(p, u); }
++static unsigned get16(const uint8_t *p) { return p[0] | p[1] << 8; }
++static uint32_t get32(const uint8_t *p) { return p[0] | p[1] << 8 | p[2] << 16 | (uint32_t)p[3] << 24; }
++static uint64_t get64(const uint8_t *p) { return get32(p) | (uint64_t)get32(p + 4) << 32; }
++static void send_raw(const void *b, size_t n) { if (write(g_cfd, b, n) != (ssize_t)n) { perror("write"); exit(2); } }
++static void send_msg(int type, const uint8_t *pl, size_t n) { uint8_t h[5]; put32(h, (uint32_t)n + 1); h[4] = (uint8_t)type; send_raw(h, 5); if (n) send_raw(pl, n); }
++static int read_fully(void *b, size_t n, int ms) {
++    uint8_t *p = b;
++    while (n) {
++        struct pollfd pf = {.fd = g_cfd, .events = POLLIN};
++        if (poll(&pf, 1, ms) <= 0) return 0;
++        ssize_t k = read(g_cfd, p, n); if (k <= 0) return 0;
++        p += k; n -= (size_t)k;
++    }
++    return 1;
++}
++// One message from the tap: its type, payload in buf (cap bytes), the payload length in *n; 0 when none arrives within ms
++static int recv_msg(uint8_t *buf, size_t cap, size_t *n, int ms) {
++    uint8_t h[5]; if (!read_fully(h, 5, ms)) return 0;
++    uint32_t len = get32(h); if (len < 1 || len - 1 > cap) return 0;
++    if (!read_fully(buf, len - 1, ms)) return 0;
++    *n = len - 1; return h[4];
++}
++static void connect_tap(void) {   // listener up, stream_start, accept
++    listen_on(); setenv("DM_STREAM", g_path, 1);
++    CHECK(stream_start("0400486024DEC000", "Test") == 0, "stream_start connects");
++    g_cfd = accept(g_lfd, NULL, NULL); if (g_cfd < 0) { perror("accept"); exit(2); }
++}
++static void drop_tap(void) { if (g_cfd >= 0) close(g_cfd); g_cfd = -1; if (g_lfd >= 0) close(g_lfd); g_lfd = -1; unlink(g_path); }
++
++static int16_t blk[240 * 8];
++static void fill(int ch, int16_t v) { for (int i = 0; i < 240 * ch; i++) blk[i] = v; }
++// An audio message must arrive; its pcm is checked to be 240 stereo frames all equal to want (-1: just count)
++static int audio_is(int want) {
++    uint8_t m[4096]; size_t n; int t = recv_msg(m, sizeof m, &n, 1000);
++    if (t != 3 || n != 9 + 240 * 4 || m[8] != 2) return 0;
++    const int16_t *s = (const int16_t *)(m + 9);
++    for (int i = 0; i < 480; i++) if (s[i] != want) return 0;
++    return 1;
++}
++static int no_message(void) { uint8_t h[5]; return !read_fully(h, 5, 60); }   // nothing at all arrives within 60 ms (a message of any size counts)
++
++int main(void) {
++    snprintf(g_dir, sizeof g_dir, "/tmp/t_stream.XXXXXX");
++    if (!mkdtemp(g_dir)) { perror("mkdtemp"); return 2; }
++    snprintf(g_path, sizeof g_path, "%s/s", g_dir);
++    stream_quit_hook = test_quit;
++
++    // (a) hello
++    connect_tap();
++    uint8_t m[4096]; size_t n; int t = recv_msg(m, sizeof m, &n, 1000);
++    CHECK(t == 1 && n == 2 + 16 + 2 + 4, "hello: type and size");
++    CHECK(get16(m) == 2, "hello: version 2");
++    CHECK(!memcmp(m + 2, "0400486024DEC000", 16), "hello: title ID");
++    CHECK(get16(m + 18) == 4 && !memcmp(m + 20, "Test", 4), "hello: name");
++
++    // (b) pad
++    uint8_t pl[64];
++    pl[0] = 0; put64(pl + 1, DM_BTN_A | DM_BTN_ZR); put32(pl + 9, (uint32_t)-32767); put32(pl + 13, 5); put32(pl + 17, (uint32_t)-6); put32(pl + 21, 32767);
++    send_msg(0x12, pl, 25);
++    CHECK(wait_ge(&g_pad.n, 1), "pad 0 arrives");
++    CHECK(g_pad.buttons == (DM_BTN_A | DM_BTN_ZR) && g_pad.ax[0] == -32767 && g_pad.ax[1] == 5 && g_pad.ax[2] == -6 && g_pad.ax[3] == 32767, "pad 0 values");
++    pl[0] = 1; put64(pl + 1, DM_BTN_B); put32(pl + 9, 0); put32(pl + 13, 0); put32(pl + 17, 0); put32(pl + 21, 0);
++    send_msg(0x12, pl, 25);
++    CHECK(wait_ge(&g_padp.n, 1) && g_padp.player == 1 && g_padp.buttons == DM_BTN_B && g_pad.n == 1, "pad 1 goes to dm_pad_set_player");
++
++    // (c) motion
++    pl[0] = 0; pl[1] = 1; putf(pl + 2, 0); putf(pl + 6, 0); putf(pl + 10, -1); putf(pl + 14, 0.5f); putf(pl + 18, 0); putf(pl + 22, -0.25f);
++    send_msg(0x13, pl, 26);
++    CHECK(wait_ge(&g_msw.n, 1) && g_msw.player == 0 && g_msw.acc[2] == -1 && g_msw.rot[0] == 0.5f && g_msw.rot[2] == -0.25f, "motion frame 1 player 0 -> dm_motion_set_switch");
++    pl[0] = 1; pl[1] = 0;
++    send_msg(0x13, pl, 26);
++    CHECK(wait_ge(&g_mot.n, 1) && g_mot.player == 1 && g_mot.acc[2] == -1 && g_msw.n == 1, "motion frame 0 player 1 -> dm_motion_set");
++    pl[0] = 1; pl[1] = 1;
++    send_msg(0x13, pl, 26);   // the phone's frame is player 0's only: dropped
++    pl[0] = 1; send_msg(0x17, pl, 1);
++    CHECK(wait_ge(&g_mclear_n, 1) && g_mclear_player == 1 && g_msw.n == 1, "motionClear 1 -> dm_motion_clear(1); a phone frame of player 1 is dropped");
++
++    // (d) players
++    put32(pl, 3); send_msg(0x14, pl, 4);
++    CHECK(wait_ge(&g_players_n, 1) && g_players == 3, "players 3");
++
++    // (e) config, keyframe
++    put16(pl, 1280); put16(pl + 2, 720); pl[4] = 60; put32(pl + 5, 20000000);
++    send_msg(0x10, pl, 9);
++    CHECK(wait_ge(&g_cfg_n, 1) && g_cfg[0] == 1280 && g_cfg[1] == 720 && g_cfg[2] == 60 && g_cfg[3] == 20000000, "config values");
++    send_msg(0x11, NULL, 0);
++    CHECK(wait_ge(&g_key_n, 1), "keyframe request"); usleep(20000); CHECK(get(&g_key_n) == 1, "keyframe once");
++
++    // (f) pause 1, 1, 0
++    pl[0] = 1; send_msg(0x15, pl, 1); send_msg(0x15, pl, 1); pl[0] = 0; send_msg(0x15, pl, 1);
++    CHECK(wait_ge(&g_bg_n, 2), "pause then resume arrive"); usleep(20000);
++    CHECK(get(&g_bg_n) == 2 && g_bg_seq[0] == 1 && g_bg_seq[1] == 0, "a repeated pause is ignored: dm_background(1) once, then (0) once");
++
++    // (g) sound
++    int a1 = 0, b1 = 0, c1 = 0;   // three distinct sources
++    stream_quit_hook = test_quit;
++    fill(2, 1000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    CHECK(audio_is(1000), "clock source: one message, 2 channels, 240 frames, 1000");
++    fill(6, 0); for (int i = 0; i < 240; i++) { blk[i * 6] = 2000; blk[i * 6 + 1] = 2000; }
++    stream_audio_pcm(blk, 240 * 6 * 2, 6, 0, &b1);
++    CHECK(no_message(), "a second source's push makes no message");
++    fill(2, 1000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    CHECK(audio_is(3000), "the clock's next push carries the queued block: 1000 + 2000");
++    fill(2, 1000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    CHECK(audio_is(1000), "the queued block is used once");
++    // two blocks queued by one source: only the latest
++    fill(6, 0); for (int i = 0; i < 240; i++) blk[i * 6] = blk[i * 6 + 1] = 500;
++    stream_audio_pcm(blk, 240 * 6 * 2, 6, 0, &b1);
++    for (int i = 0; i < 240; i++) blk[i * 6] = blk[i * 6 + 1] = 700;
++    stream_audio_pcm(blk, 240 * 6 * 2, 6, 0, &b1);
++    fill(2, 0); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    CHECK(audio_is(700), "at most one queued block per source: the newest");
++    // saturation
++    fill(2, 30000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &c1);   // a third source
++    fill(2, 30000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    CHECK(audio_is(32767), "two sources at 30000 saturate to 32767");
++    // 6 channels with a fold (the sink's 8-channel block: six channels, then the fold)
++    for (int i = 0; i < 240; i++) { for (int j = 0; j < 6; j++) blk[i * 8 + j] = 9000; blk[i * 8 + 6] = 111; blk[i * 8 + 7] = -222; }
++    stream_audio_pcm(blk, 240 * 8 * 2, 8, 1, &b1);
++    fill(2, 0); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    { uint8_t am[4096]; size_t an; int at = recv_msg(am, sizeof am, &an, 1000); const int16_t *s = (const int16_t *)(am + 9);
++      CHECK(at == 3 && an == 9 + 960 && s[0] == 111 && s[1] == -222 && s[478] == 111 && s[479] == -222, "a source with a fold sends the fold"); }
++    // 6 channels without a fold: L = FL + 0.7071 (C + SL), R = FR + 0.7071 (C + SR), LFE dropped
++    { int16_t px[6] = {1000, 2000, 3000, 9999, 4000, 5000};
++      for (int i = 0; i < 240; i++) memcpy(blk + i * 6, px, sizeof px);
++      stream_audio_pcm(blk, 240 * 6 * 2, 6, 0, &b1);
++      fill(2, 0); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++      uint8_t am[4096]; size_t an; int at = recv_msg(am, sizeof am, &an, 1000); const int16_t *s = (const int16_t *)(am + 9);
++      int l = (int)(1000 + 0.7071f * (3000 + 4000)), r = (int)(2000 + 0.7071f * (3000 + 5000));
++      CHECK(at == 3 && abs(s[0] - l) <= 1 && abs(s[1] - r) <= 1, "6 channels without a fold: front plus 0.7071 centre and surround, LFE dropped"); }
++    // a source that has not pushed for 100 ms is forgotten; when it was the clock the next source to push is
++    usleep(130000);
++    fill(2, 400); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &b1);
++    CHECK(audio_is(400), "the clock was forgotten: the next source to push is the clock");
++    fill(2, 100); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &a1);
++    CHECK(no_message(), "the old clock is a plain source again");
++    fill(2, 400); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &b1);
++    CHECK(audio_is(500), "and its queued block is mixed in");
++
++    // sink threads read their clock before taking the mixer's lock: a push stamped slightly before the clock's last one must not forget the clock
++    { uint64_t T = clock_gettime_nsec_np(CLOCK_UPTIME_RAW) + 10000000000ull; int ca = 0, cb = 0;
++      fill(2, 1000); stream_audio_pcm_at(blk, 240 * 2 * 2, 2, 0, &ca, T);
++      CHECK(audio_is(1000), "late-clock test: A is the clock");
++      fill(2, 2000); stream_audio_pcm_at(blk, 240 * 2 * 2, 2, 0, &cb, T - 1000000);
++      CHECK(no_message(), "a push stamped 1 ms before the clock's last makes no message");
++      fill(2, 1000); stream_audio_pcm_at(blk, 240 * 2 * 2, 2, 0, &ca, T + 5000000);
++      CHECK(audio_is(3000), "A is still the clock: one message with B's block");
++      CHECK(no_message(), "and only one"); }
++
++    // (h) video
++    CHECK(g_sink != NULL, "the video sink is registered");
++    const uint8_t fr[5] = {1, 2, 3, 4, 5};
++    g_sink(fr, 5, 1, -1, 1280, 720, 123456789ull);
++    t = recv_msg(m, sizeof m, &n, 1000);
++    CHECK(t == 2 && n == 21 + 5 && get32(m) == 0 && get64(m + 4) == 123456789ull && get16(m + 12) == 1280 && get16(m + 14) == 720 && m[16] == 1 && get32(m + 17) == 0xffffffffu && !memcmp(m + 21, fr, 5), "video message: frame 0, time, size, key, token -1 (none), bytes");
++    g_sink(fr, 3, 0, 70000, 640, 360, 5);
++    t = recv_msg(m, sizeof m, &n, 1000);
++    CHECK(t == 2 && n == 21 + 3 && get32(m) == 1 && m[16] == 0 && get32(m + 17) == 70000 && !memcmp(m + 21, fr, 3), "video frame numbers count from 0 in the order sent; the token after key");
++    g_sink(fr, 4, 2, 5, 640, 360, 6);   // flags 2 (a repair frame) passes unchanged
++    t = recv_msg(m, sizeof m, &n, 1000);
++    CHECK(t == 2 && n == 21 + 4 && get32(m) == 2 && m[16] == 2 && get32(m + 17) == 5 && !memcmp(m + 21, fr, 4), "video message: the flags byte 2 (repair frame) goes from the sink to the socket unchanged");
++    int keys = get(&g_key_n);
++    g_sink(fr, (8u << 20) - 21, 0, -1, 640, 360, 7);   // over the message limit by one byte: dropped before its bytes are read
++    CHECK(get(&g_key_n) == keys + 1, "an oversized frame asks for a key frame");
++    g_sink(fr, 3, 0, -1, 640, 360, 8);
++    t = recv_msg(m, sizeof m, &n, 1000);
++    CHECK(t == 2 && get32(m) == 4, "an oversized frame is dropped with its number: the next is frame 4");
++
++    // (k) the listener closes: the hook once
++    CHECK(get(&g_quit_n) == 0, "no quit so far");
++    drop_tap();
++    CHECK(wait_ge(&g_quit_n, 1), "a closed socket calls the hook"); usleep(30000); CHECK(get(&g_quit_n) == 1, "once");
++
++    // (i) a length above 8 MiB
++    connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++    { uint8_t h[4]; put32(h, 0x00900000); send_raw(h, 4); }
++    CHECK(wait_ge(&g_quit_n, 2), "a length of 0x00900000 calls the hook"); usleep(30000); CHECK(get(&g_quit_n) == 2, "once");
++    drop_tap(); usleep(30000); CHECK(get(&g_quit_n) == 2, "the closing after a quit does not call it again");
++
++    // (j) quit
++    connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++    send_msg(0x16, NULL, 0);
++    CHECK(wait_ge(&g_quit_n, 3), "quit calls the hook"); usleep(30000); CHECK(get(&g_quit_n) == 3, "once");
++    drop_tap();
++
++    // an unknown type and a wrong size also end it
++    connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++    send_msg(0x7f, NULL, 0);
++    CHECK(wait_ge(&g_quit_n, 4), "an unknown type calls the hook");
++    drop_tap(); connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++    send_msg(0x15, pl, 2);
++    CHECK(wait_ge(&g_quit_n, 5), "a message of the wrong size calls the hook");
++    drop_tap();
++
++    // ltrAck and refresh reach the video code; a wrong size of either ends the stream
++    connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++    { uint8_t a[1 + 64]; a[0] = 3; put32(a + 1, 0); put32(a + 5, 0x7fffffff); put32(a + 9, (uint32_t)-2); send_msg(0x18, a, 13);
++      CHECK(wait_ge(&g_ack_n, 1) && g_ack_count == 3 && g_ack[0] == 0 && g_ack[1] == 0x7fffffff && g_ack[2] == -2, "ltrAck: 3 tokens reach stream_video_ltr_ack in order");
++      a[0] = 16; for (int i = 0; i < 16; i++) put32(a + 1 + 4 * i, (uint32_t)(100 + i)); send_msg(0x18, a, 65);
++      CHECK(wait_ge(&g_ack_n, 2) && g_ack_count == 16 && g_ack[0] == 100 && g_ack[15] == 115, "ltrAck: 16 tokens, the most a message holds");
++      send_msg(0x19, NULL, 0);
++      CHECK(wait_ge(&g_refresh_n, 1), "refresh reaches stream_video_refresh"); usleep(20000);
++      CHECK(get(&g_refresh_n) == 1 && get(&g_quit_n) == 5, "refresh once, and the stream goes on");
++      drop_tap(); CHECK(wait_ge(&g_quit_n, 6), "closing it calls the hook");   // counted before the wrong sizes, each of which must add exactly one
++      struct { uint8_t type, len, a0; const char *what; } bad[] = {{0x18, 1, 0, "ltrAck with a count of 0"}, {0x18, 9, 3, "ltrAck shorter than its count"}, {0x18, 13, 2, "ltrAck longer than its count"},
++                                                             {0x18, 69, 17, "ltrAck with a count of 17"}, {0x19, 1, 0, "refresh with a payload"}};
++      for (int i = 0; i < 5; i++) {
++          int q = get(&g_quit_n), acks = get(&g_ack_n), refs = get(&g_refresh_n);
++          connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++          uint8_t b[80] = {0}; b[0] = bad[i].a0; send_msg(bad[i].type, b, bad[i].len);
++          char what[96]; snprintf(what, sizeof what, "%s ends the stream, unseen by the video code", bad[i].what);
++          CHECK(wait_ge(&g_quit_n, q + 1) && get(&g_ack_n) == acks && get(&g_refresh_n) == refs, what);
++          drop_tap();   // the stream has ended: closing it does not call the hook again
++      } }
++
++    // (m) the prepare step: prepare messages (0x04: phase 1, done 4, total 4), hello first, no video or audio until it ends, the rate limit, the end once, quit meanwhile, the switch
++    { CHECK(stream_prepare_wanted() == 0, "prepare: not wanted once the stream has ended");
++      int qn = get(&g_quit_n), keys0, src = 0;
++      connect_tap();
++      unsetenv("DM_STREAM_PREPARE");
++      CHECK(stream_prepare_wanted() == 1, "prepare: wanted when connected (DM_STREAM_PREPARE unset)");
++      uint64_t T = clock_gettime_nsec_np(CLOCK_UPTIME_RAW), ms = 1000000;
++      stream_prepare_begin();
++      stream_prepare_at(1, 0, 7250, T);
++      t = recv_msg(m, sizeof m, &n, 1000);
++      CHECK(t == 1, "prepare: the connection's hello is the first message (the real order before the guest starts is front_mac.m's)");
++      t = recv_msg(m, sizeof m, &n, 1000);
++      CHECK(t == 4 && n == 9 && m[0] == 1 && get32(m + 1) == 0 && get32(m + 5) == 7250, "prepare: type 4, 9 bytes: phase 1, done 0, total 7250 when the phase starts");
++      { const uint8_t want[14] = {10, 0, 0, 0, 4, 2, 0x34, 0x12, 0, 0, 0x78, 0x56, 0x34, 0x12}; uint8_t raw[14];
++        stream_prepare_at(2, 0x1234, 0x12345678, T); CHECK(read_fully(raw, 14, 1000) && !memcmp(raw, want, 14), "prepare: the bytes on the socket, little-endian (phase 2 start)"); }
++      stream_prepare_at(1, 0, 7250, T);   // phase 1 again: a new start
++      recv_msg(m, sizeof m, &n, 1000);
++      // a 10 ms call rate over 2 s: the start was at T, then one message per 250 ms at most
++      int sent = 0, ok = 1; uint64_t last = T;
++      for (int i = 1; i < 200; i++) {
++          uint64_t now = T + (uint64_t)i * 10 * ms; stream_prepare_at(1, i, 7250, now);
++          if (recv_msg(m, sizeof m, &n, 2) == 4) { sent++; if (now - last < 250 * ms || get32(m + 1) != (uint32_t)i) ok = 0; last = now; }
++      }
++      CHECK(sent == 7 && ok, "prepare: at most 4 a second while a phase runs (7 more in 1.99 s), each with the done of its call");
++      // video and audio meanwhile: none on the socket; the frame number is not used
++      keys0 = get(&g_key_n);
++      g_sink(fr, 3, 0, -1, 640, 360, 9);
++      fill(2, 1000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &src);
++      CHECK(no_message(), "prepare: no video or audio message while preparing");
++      stream_prepare_at(1, 7250, 7250, last + 10 * ms);   // the end inside 250 ms of the last: sent all the same
++      t = recv_msg(m, sizeof m, &n, 1000);
++      CHECK(t == 4 && m[0] == 1 && get32(m + 1) == 7250 && get32(m + 5) == 7250, "prepare: the end is sent with done == total");
++      stream_prepare_at(1, 7250, 7250, last + 900 * ms); stream_prepare_at(1, 7300, 7250, last + 1900 * ms);
++      CHECK(no_message(), "prepare: the end once");
++      stream_prepare_at(2, 0, 0, last + 2000 * ms);
++      t = recv_msg(m, sizeof m, &n, 1000);
++      CHECK(t == 4 && m[0] == 2 && get32(m + 1) == 0 && get32(m + 5) == 0, "prepare: a phase with nothing to do: its start is its end, one message");
++      stream_prepare_at(2, 0, 0, last + 2100 * ms);
++      CHECK(no_message(), "prepare: and only one");
++      stream_prepare_end();
++      g_sink(fr, 3, 0, -1, 640, 360, 10);
++      t = recv_msg(m, sizeof m, &n, 1000);
++      CHECK(t == 2 && get32(m) == 0, "prepare: the first video after the end is frame 0");
++      CHECK(get(&g_key_n) == keys0 + 1, "prepare: a frame dropped while preparing asks for a key frame at the end");
++      fill(2, 1000); stream_audio_pcm(blk, 240 * 2 * 2, 2, 0, &src);
++      CHECK(audio_is(1000), "prepare: audio flows after the end");
++      stream_prepare_at(1, 5, 10, last + 3000 * ms);   // after the end: nothing more
++      CHECK(no_message(), "prepare: no prepare message after the end");
++      drop_tap(); CHECK(wait_ge(&g_quit_n, qn + 1), "prepare: closing calls the hook");
++
++      // quit while preparing: the hook, at once
++      qn = get(&g_quit_n);
++      connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++      stream_prepare_begin(); stream_prepare(2, 10, 34649);
++      CHECK(recv_msg(m, sizeof m, &n, 1000) == 4, "prepare: a phase under way");
++      uint64_t q0 = clock_gettime_nsec_np(CLOCK_UPTIME_RAW);
++      send_msg(0x16, NULL, 0);
++      CHECK(wait_ge(&g_quit_n, qn + 1) && clock_gettime_nsec_np(CLOCK_UPTIME_RAW) - q0 < 100 * ms, "prepare: a quit while preparing calls the hook within 100 ms");
++      drop_tap();
++
++      // the switch: DM_STREAM_PREPARE=0, nothing waits, video flows
++      qn = get(&g_quit_n);
++      connect_tap(); recv_msg(m, sizeof m, &n, 1000);
++      setenv("DM_STREAM_PREPARE", "0", 1);
++      CHECK(stream_prepare_wanted() == 0, "prepare: DM_STREAM_PREPARE=0 is not wanted");
++      setenv("DM_STREAM_PREPARE", "1", 1);
++      CHECK(stream_prepare_wanted() == 1, "prepare: DM_STREAM_PREPARE=1 is");
++      unsetenv("DM_STREAM_PREPARE");
++      g_sink(fr, 3, 1, -1, 640, 360, 11);
++      t = recv_msg(m, sizeof m, &n, 1000);
++      CHECK(t == 2 && get32(m) == 0, "prepare: without a prepare step video flows from the first frame");
++      drop_tap(); wait_ge(&g_quit_n, qn + 1); }
++
++    // (l) no listener
++    CHECK(stream_start("0400486024DEC000", "Test") != 0, "stream_start without a listener fails");
++    char longp[200]; memset(longp, 'x', sizeof longp - 1); longp[sizeof longp - 1] = 0; setenv("DM_STREAM", longp, 1);
++    CHECK(stream_start("0400486024DEC000", "Test") != 0, "a path too long for sun_path fails");
++
++    rmdir(g_dir);
++    printf("t_stream: %d checks, %d failed\n", checks, fails);
++    return fails != 0;
++}
+diff --git a/dm/mac/launcher.c b/dm/mac/launcher.c
+index 509b1f2e5064adb15f91e27327ceb2d69e98b507..f15c142457a6693d5184892269dddc1ded788808 100644
+--- a/dm/mac/launcher.c
++++ b/dm/mac/launcher.c
+@@ -222,11 +222,17 @@ int main(int argc, char **argv) {
+     setenv("DM_SAVE", save, 0);   // before the window: its cloud-save check compares this save with the cloud's (Launcher.swift SaveCheck)
+     int window = !(getenv("DM_LAUNCHER") && !strcmp(getenv("DM_LAUNCHER"), "0"));
+     for (int i = 1; i < argc; i++) if (!strcmp(argv[i], "--no-launcher")) window = 0;
+-    if (!window) fprintf(stderr, "launcher: no settings window (DM_LAUNCHER=0 or --no-launcher)\n");
++    if (getenv("DM_STREAM")) window = 0;   // a streaming front end started this app: no window, no sound device
++    if (!window) fprintf(stderr, "launcher: no settings window (DM_LAUNCHER=0, --no-launcher or DM_STREAM)\n");
+     int shown = window ? dm_mac_launcher() : 2;
+     if (!shown) return 0;   // Quit: no game
+     if (shown == 2) saved_choices();
+     cloud_saves_folder();
++    if (getenv("DM_STREAM")) {   // a streamed game never opens the Mac's microphone, nor asks for it: its player is at the Host's client, and a consent alert here would hold the start
++        const char *mic = getenv("DM_MIC");
++        if (mic && !strcmp(mic, "1")) fprintf(stderr, "[RED] launcher: DM_STREAM: the microphone stays off (DM_MIC=1 was asked for)\n");
++        setenv("DM_MIC", "0", 1);
++    }
+     microphone_at_launch();
+     setenv("DM_ROOT", sup, 0); setenv("DM_ROMFS", romfs, 0); setenv("DM_TEMP", temp, 0);
+     snprintf(p, sizeof p, "%s/Library/Application Support/nxnative/system", home); setenv("DM_SYSTEM_DIR", p, 0);   // the player's own console files, for every game
+@@ -243,7 +249,7 @@ int main(int argc, char **argv) {
+     snprintf(p, sizeof p, "%s/aoc", res); if (!stat(p, &st)) setenv("DM_AOC_DIR", p, 0);
+     snprintf(p, sizeof p, "%s/pso", res); if (!stat(p, &st)) setenv("DM_PSO_BUNDLE", p, 0);   // the bases of every shader pair: the first start builds none
+     if (*lang) setenv("DM_LANG", lang, 0);
+-    setenv("DM_WINDOW", "1", 0); setenv("DM_AUDIO", "1", 0);
++    if (!getenv("DM_STREAM")) { setenv("DM_WINDOW", "1", 0); setenv("DM_AUDIO", "1", 0); }
+     programs_table(contents, res, sup);
+     if (chdir(sup)) { fprintf(stderr, "[RED] launcher: cannot enter %s\n", sup); return 1; }
+     struct sigaction sa = {.sa_handler = forward};   // no SA_RESTART: waitpid below sees EINTR and waits again
+diff --git a/dm/mac/pack_app.py b/dm/mac/pack_app.py
+index 0a8f4e156c24a0df4e8c68399e0e287a7269c885..3d650b1abe140aa982af3200d3d6c0551ba7ea27 100755
+--- a/dm/mac/pack_app.py
++++ b/dm/mac/pack_app.py
+@@ -129,7 +129,7 @@ def info_plist(a, minos, icon):
+          'CFBundleVersion': a.version or '1.0', 'CFBundleShortVersionString': a.version or '1.0', 'CFBundlePackageType': 'APPL', 'CFBundleExecutable': EXE,
+          'CFBundleInfoDictionaryVersion': '6.0', 'LSMinimumSystemVersion': minos, 'LSArchitecturePriority': ['arm64'], 'NSHighResolutionCapable': True,
+          'NSBluetoothAlwaysUsageDescription': 'Connect Switch 2 Joy-Con and Pro Controllers over Bluetooth.',
+-         'LSApplicationCategoryType': a.category or 'public.app-category.games', 'LSSupportsGameMode': False, 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US', 'DMSaveSyncChoice': 1}
++         'LSApplicationCategoryType': a.category or 'public.app-category.games', 'LSSupportsGameMode': False, 'DMTitleID': a.title_id.upper(), 'DMRomfsMarker': a.marker or '', 'DMLanguage': a.lang or 'en-US', 'DMSaveSyncChoice': 1, 'DMStream': True}
+     if icon: p['CFBundleIconFile'] = 'AppIcon'
+     if a.settings:
+         listed = json.loads(Path(a.settings).read_text(encoding='utf-8'))['settings']
+diff --git a/dm/tools/tests/test_nsp_mac_app.py b/dm/tools/tests/test_nsp_mac_app.py
+index b5626e7236c276b37f38d7f56d9af98ad0136055..03da24c4218675d2757df304246bda29a0e74a36 100644
+--- a/dm/tools/tests/test_nsp_mac_app.py
++++ b/dm/tools/tests/test_nsp_mac_app.py
+@@ -888,6 +888,17 @@ class App(unittest.TestCase):
+         self.assertIn('standin host output', (logs / f'{TID}.prev.log').read_text())
+         self.assertEqual(self.host_run()['DM_LANG'], 'fr')   # Info.plist DMLanguage
+ 
++    def test_stream_turns_the_microphone_off(self):   # DM_STREAM: no settings window, no window or sound device, and never the Mac's microphone, whatever DM_MIC asks
++        log = self.tmp / f'home/Library/Logs/nxnative/{TID}.log'
++        p = self.launch(DM_STREAM=str(self.tmp / 'no-host.sock'), DM_MIC='1', DM_LAUNCHER='1'); p.communicate(timeout=30)
++        self.assertEqual(p.returncode, 7)
++        r = self.host_run()
++        self.assertEqual(r.get('DM_MIC'), '0')
++        self.assertNotIn('DM_WINDOW', r); self.assertNotIn('DM_AUDIO', r)
++        self.assertIn('[RED] launcher: DM_STREAM: the microphone stays off', log.read_text())
++        p = self.launch(DM_STREAM=str(self.tmp / 'no-host.sock')); p.communicate(timeout=30)
++        self.assertEqual(self.host_run().get('DM_MIC'), '0'); self.assertNotIn('microphone stays off', log.read_text())   # nothing asked: no red line
++
+     def test_sigterm(self):   # forwarded to the host, whose exit code comes back
+         p = self.launch(wait=True)
+         for _ in range(100):
+diff --git a/docs/development.md b/docs/development.md
+index 6864a69158cc99a3cc7412813e2830e356391f95..c224f71d69166e2e5c448d35b4191a5a3fd0a519 100644
+--- a/docs/development.md
++++ b/docs/development.md
+@@ -826,7 +826,7 @@ Every 300 frames the log has a `pipelines up to frame` line. It gives the submit
+ 
+ The **prebuild** puts the pulling base of every known shader pair into the archive (`pso_prebuild`), so a cold start's draws have stand-ins. The pairs come from the profile's `shader_pairs.tsv` and `pso_pairs.tsv`. `shader_pairs.tsv` pairs the stages of one BNSH variation (and the other readers' programs). It held none of the pairs from agl's BAHS shader archives (`.sharcb`, the agl / gsys / terrain resource packs), and in Breath of the Wild 109 of the 543 pairs drawn on entering Zora's Domain came from those. `shader_split.py` now reads the binary and program arrays of a BAHS file (`bahs_variations`) and pairs the n-th vertex binary of a program with its n-th fragment binary. Those pairs go to `pso_pairs.tsv`. The shader build reads both tables to pad every vertex output its pixel partners need ([reference](reference/shaders.md#pixel-shader-inputs-the-vertex-shader-does-not-write)); the pairs also control build order and cache dependencies. The profile's `pso_pairs.tsv` is part of its inputs digest. For Breath of the Wild that is 3,012 more pairs, and all 543 pairs drawn are now known. A profile made before the table existed still packs: the NSP script then keeps the table beside the shader package, where the shader build reads it, and hands it to the prebuild (`DM_PSO_PAIRS`). Super Mario Odyssey, Mario Bros. Wonder, Mario Kart 8 Deluxe, 3D World, Animal Crossing, Captain Toad and Tears of the Kingdom have BAHS files too; their tables are made at their next pack.
+ 
+-With the prepare step (a window, the iPhone) the prebuild runs right after it when the bases are not there yet, before the game's first frame, behind the same progress screen ("Preparing pipelines"), on every core, flushing every 1,000 bases; a first start waits for it once, until every pair is handed to a worker (the compiles still under way then finish in the background). Built in the background while playing instead, they took an iPhone 17 Pro Max's GPU from about 13 to 15–18 ms a frame in Breath of the Wild, through the compiler's load on the shared power budget. Without a prepare step it still runs in the background after the prewarm, on a utility queue on half the performance cores (`DM_PSO_PREBUILD=0` turns it off either way). On the Mac it also runs as a tool, `DM_PSO_PREBUILD=tool`: what a first start would build, then exit. The NSP script runs the tool in a `--platform mac` build, into `<id>_build/run/pso_archive` (log `pso_prebuild.log`): this is how the Mac gets its archive. The pairs run once per chain version, depth mode and pair list (`pso_archive/prebuilt.tsv`: the pair lists' size and SHA-256). Then the tool builds the prewarm lists' pipelines (the lists a start reads: `DM_PSO_MANIFEST`, or the profile's `pso_manifest.tsv` and the device's `pso_user.tsv`) with the prepare step's own decode, the `R` rows' bases, the `C` rows' compute pipelines and the `M` rows' mesh pipelines, capturing them and keeping nothing (no specialization: none is archived), so the first run's prepare step finds them; once they are in the archive this takes seconds, so the lists have no stamp. `DM_PSO_PREBUILD_WARM=0` leaves them to the first start. Pairs whose base failed to build are listed in `pso_archive/prebuild_failed.tsv` with the system build they failed on; a later start of that system build leaves them to the draws, another one tries them again. `DM_PSO_PREBUILD_DEPTH=zero` serves a game that sets the near=0 depth mode (the NSP script sets it from the profile key `depth_mode`); `DM_PSO_PREBUILD_THREADS=<n>` sets the workers (default: as many as Metal's compiler runs at once; [A prebuild pool sized from the Super cores](reference/shaders.md#a-prebuild-pool-sized-from-the-super-cores)). Its files hold bases without a vertex layout only, and are named `pNNNNN.mtl4a`; a base with a vertex layout is never looked up in them, and compaction leaves them alone. Breath of the Wild on an M2 Max: 15,767 bases, 910 MB in 16 files, 187 s with 7 workers for the first 12,755 and 19 s for the 3,012 more. Opening the files took 2.2 s on the first start (0.25 s from the file cache). The host's footprint is about 850 MB larger with them open (2,067 against 1,215 MiB at the title), which is one reason the Metal 4 path stays off on iOS unless a game's profile was tested with it (`pso_mtl4`). On iOS the standard is the archive made on the Mac and shipped in the app (next section); the device's own prebuild is the fallback, for an app without a usable archive.
++With the prepare step (a window, the iPhone) the prebuild runs right after it when the bases are not there yet, before the game's first frame, behind the same progress screen ("Preparing pipelines"), on every core, flushing every 1,000 bases; a first start waits for it once, until every pair is handed to a worker (the compiles still under way then finish in the background). Built in the background while playing instead, they took an iPhone 17 Pro Max's GPU from about 13 to 15–18 ms a frame in Breath of the Wild, through the compiler's load on the shared power budget. With `DM_STREAM` the tap stands in for the window: the game prepares before its first frame and the Host is shown the progress ([Streaming front ends](frontends.md#streaming-front-ends); `DM_STREAM_PREPARE=0` leaves both to the background). Without a prepare step it still runs in the background after the prewarm, on a utility queue on half the performance cores (`DM_PSO_PREBUILD=0` turns it off either way). On the Mac it also runs as a tool, `DM_PSO_PREBUILD=tool`: what a first start would build, then exit. The NSP script runs the tool in a `--platform mac` build, into `<id>_build/run/pso_archive` (log `pso_prebuild.log`): this is how the Mac gets its archive. The pairs run once per chain version, depth mode and pair list (`pso_archive/prebuilt.tsv`: the pair lists' size and SHA-256). Then the tool builds the prewarm lists' pipelines (the lists a start reads: `DM_PSO_MANIFEST`, or the profile's `pso_manifest.tsv` and the device's `pso_user.tsv`) with the prepare step's own decode, the `R` rows' bases, the `C` rows' compute pipelines and the `M` rows' mesh pipelines, capturing them and keeping nothing (no specialization: none is archived), so the first run's prepare step finds them; once they are in the archive this takes seconds, so the lists have no stamp. `DM_PSO_PREBUILD_WARM=0` leaves them to the first start. Pairs whose base failed to build are listed in `pso_archive/prebuild_failed.tsv` with the system build they failed on; a later start of that system build leaves them to the draws, another one tries them again. `DM_PSO_PREBUILD_DEPTH=zero` serves a game that sets the near=0 depth mode (the NSP script sets it from the profile key `depth_mode`); `DM_PSO_PREBUILD_THREADS=<n>` sets the workers (default: as many as Metal's compiler runs at once; [A prebuild pool sized from the Super cores](reference/shaders.md#a-prebuild-pool-sized-from-the-super-cores)). Its files hold bases without a vertex layout only, and are named `pNNNNN.mtl4a`; a base with a vertex layout is never looked up in them, and compaction leaves them alone. Breath of the Wild on an M2 Max: 15,767 bases, 910 MB in 16 files, 187 s with 7 workers for the first 12,755 and 19 s for the 3,012 more. Opening the files took 2.2 s on the first start (0.25 s from the file cache). The host's footprint is about 850 MB larger with them open (2,067 against 1,215 MiB at the title), which is one reason the Metal 4 path stays off on iOS unless a game's profile was tested with it (`pso_mtl4`). On iOS the standard is the archive made on the Mac and shipped in the app (next section); the device's own prebuild is the fallback, for an app without a usable archive.
+ 
+ Breath of the Wild's cold starts with and without the prebuild and `pso_pairs.tsv`: [its note](../dm/games/01007EF00011E000/README.md#pipelines-on-a-cold-start).
+ 
+diff --git a/docs/env_switches.tsv b/docs/env_switches.tsv
+index 8123312fff4fb43dd89be2919d5d3aa50faa9138..72f4155740838ce28ccf5857c5fb1d14a19af453 100644
+--- a/docs/env_switches.tsv
++++ b/docs/env_switches.tsv
+@@ -416,6 +416,8 @@ DM_SPIN	switch	`0` makes the rewriter's spin gate return at once, so guest poll
+ DM_SPIN_LIST	diagnostic	`=1` makes `patch_nso.py` print every guest poll loop it found and sends through a spin gate
+ DM_SPIN_POLL	switch	`=<µs>`: how long a spin-gate wait polls before it sleeps with the yield back-off (default 2000; `0` yields on every pass)
+ DM_SPLIT_REGISTERED_MAP	path	Registered `shader_map.tsv` used by the splitter to keep a known source label when the same shader is found in several places
++DM_STREAM	switch	`=<socket path>` (Mac) runs the game for a streaming front end: no window, no sound device and no microphone (`DM_WINDOW`, `DM_AUDIO` and `DM_MIC` do not apply; the packed app shows no settings window and asks for no microphone access), the host connects to the Unix socket at that path before the guest starts and exits with code 1 if it cannot. Each frame is drawn into an IOSurface and encoded as HEVC (`dm/host/stream.h`, `stream_video_mac.m`); nothing is encoded until the front end configures the stream. The sound, the controllers, pause and quit go over the same socket (`stream_mac.c`, [Streaming front ends](frontends.md#streaming-front-ends))
++DM_STREAM_PREPARE	switch	`0` (with `DM_STREAM`, unless `DM_PSO_PREPARE=1`) starts the game at once and builds the prewarm lists' pipelines and the shader pairs' prebuild in the background while it plays, as without a window; by default the game builds them before its first frame, on every core, and the Host is shown the progress in `prepare` messages ([Streaming front ends](frontends.md#streaming-front-ends))
+ DM_SVC	diagnostic	`=1` logs memory SVCs (`SetHeapSize`, `MapMemory`, `Map`/`UnmapPhysicalMemory`) with their addresses and sizes
+ DM_SW2	player	`=1` turns on Switch 2 controllers over Bluetooth LE (Joy-Con 2, Pro Controller 2): the settings window's Switch 2 controllers. Off, no Bluetooth client is created and macOS asks nothing. The host also stays off when the app's Info.plist has no NSBluetoothAlwaysUsageDescription, without which macOS ends the process at the first Bluetooth scan
+ DM_SW2_GYRO_DPS	diagnostic	`=<degrees per second per count>` is the Switch 2 controllers' gyro scale (default 0.0607, measured on a left and a right Joy-Con 2; the Switch family's nominal 0.070 turned a 90 degree tilt into 104)
+@@ -469,7 +471,7 @@ DM_WATCH_SAMPLE	diagnostic	`=<path>` (Mac): when the stall watchdog fires, sampl
+ DM_WATCH_STALL	diagnostic	`=<s>`: when the frame loop makes no progress for that long (default 15 with `DM_WATCH`), logs a red line, dumps the threads and exits
+ DM_WEB_LOG	diagnostic	`1` logs each key an offline HTML page is given and where the focus is after it
+ DM_WINDOW	switch	When set (to any value, `0` included) opens a Mac window with keyboard and controller input; unset runs headless with the guest on the current thread; the Mac launcher sets it
+-DM_WINDOWLESS_ROLE	switch	`0` keeps the existing task role for a windowless Mac run. By default the host requests the [default application task role](reference/audio.md#underruns-in-a-run-without-a-window) to enable interactive QoS
++DM_WINDOWLESS_ROLE	switch	`0` keeps the existing task role for a windowless Mac run, a streamed one (`DM_STREAM`) included. By default the host requests the [default application task role](reference/audio.md#underruns-in-a-run-without-a-window) to enable interactive QoS
+ DM_WINDOW_TOP	diagnostic	`1` (Mac, with `DM_WINDOW`) orders the game window in front without activating it and keeps it above other apps' windows, so a covered window does not slow the run; `regress.py` sets it
+ DM_XCODE_DERIVED_DATA	path	Xcode derived data folder for `build_ipa.sh` (default `$W/build/ios/xcode-dd`); the NSP script points it into the game's build folder
+ DM_XCODE_PROJECT_DIR	path	Folder of the per-game Xcode project that `build_ipa.sh --prepare-xcode` makes (default `$W/xcode`); the NSP script sets it
+diff --git a/docs/frontends.md b/docs/frontends.md
+index 24f81e7c34407a624a869f3cf442eac49b249f96..77fb62a6c8aa42c34308af25c3bcf4ba98f20832 100644
+--- a/docs/frontends.md
++++ b/docs/frontends.md
+@@ -128,6 +128,34 @@ A packed Mac app exposes `DM_MIC` in its settings list when a game imports the s
+ 
+ The Mac launcher stores a selected input device's Core Audio UID as the string `launcher.DM_MIC_DEVICE` in the app's preferences. A `DM_MIC_DEVICE` set at launch or in an env file takes precedence. Use `default` to follow the system input. `DM_MIC_GAIN` uses the saved choices described above.
+ 
++## Streaming front ends
++
++A front end that shows the game somewhere else (another device) starts the host with `DM_STREAM=<path of a Unix socket it listens on>`. The host runs with no window, no sound device and no microphone (`DM_MIC` is forced off: the packed app asks for no access, and the host opens no input device), connects to the socket, and from then on the front end is the picture, the sound and the controllers.
++
++Messages in both directions: `u32` length of (type + payload), `u8` type, payload. Integers are little-endian and fields are packed in the order below; floats are IEEE-754 bits. A length of 0 or above 8 MiB ends the stream. Version: `STREAM_TAP_VERSION` in `dm/host/stream.h`; a layout change bumps it on both sides.
++
++| Type | Name | From | Fields (bytes) |
++|---|---|---|---|
++| 0x01 | hello | host | version 2 (2), title ID 16 (ASCII, `0x00` padded), name length 2, name (UTF-8) |
++| 0x02 | video | host | frame 4 (from 0; a gap is a frame dropped after encoding), capture ns 8, width 2, height 2, flags 1 (bit 0 = key frame; bit 1 = repair frame: encoded with ForceLTRRefresh and not a key frame; a key frame is never also a repair frame; other bits 0), token 4 (signed: the frame's long-term reference token, opaque, -1 for none), data: 4-byte big-endian length-prefixed HEVC NAL units, a key frame led by VPS, SPS, PPS |
++| 0x03 | audio | host | capture ns 8, channels 1 (2), 48 kHz 16-bit PCM, 240 frames (5 ms) |
++| 0x04 | prepare | host | phase 1 (1 the prewarm lists' pipelines, 2 the shader pairs' prebuild; other values may come), done 4, total 4: the prepare step before the first frame |
++| 0x10 | config | front end | max width 2, max height 2, max fps 1, bitrate 4 (bit/s); video starts with the first one |
++| 0x11 | keyframe | front end | none: the next frame is a key frame |
++| 0x12 | pad | front end | player 1 (0 to 7), buttons 8 (`DM_BTN_*`), lx 4, ly 4, rx 4, ry 4 (signed) |
++| 0x13 | motion | front end | player 1, frame 1 (0 controller, 1 the phone's, player 0 only), acceleration 3 x 4 (G), rotation 3 x 4 (rad/s) |
++| 0x14 | players | front end | mask 4 (bit p: player p + 1 has a controller) |
++| 0x15 | pause | front end | on 1: the background sequence (as `DM_OE_SCRIPT` `bg=1` / `bg=0`); a repeat of the current state is ignored |
++| 0x16 | quit | front end | none: a graceful exit (as SIGTERM) |
++| 0x17 | motionClear | front end | player 1 |
++| 0x18 | ltrAck | front end | count 1 (1 to 16), count x token 4 (signed): the front end decoded the frames that carried these tokens, each returned unchanged |
++| 0x19 | refresh | front end | none: a frame was lost; the next frame depends on nothing the front end may not have |
++
++- Sound: each silent sound output pushes a 5 ms block; the first to push is the clock, and each of its pushes sends one message mixing its block with the latest queued block of every other output (a 6-channel output without a stereo fold is mixed at 0.7071, the sum saturates). An output silent for 100 ms is forgotten.
++- Long-term references: a frame that carries a token (not every frame does; once the front end acknowledges tokens, each next frame does) can be acknowledged with `ltrAck` when the front end has decoded it. After a `refresh` the next frame is predicted only from an acknowledged frame, or is a key frame when nothing was acknowledged since the last key frame. A token is opaque: the front end returns it exactly as the video message carried it (it holds the encoder session, so an acknowledgement from before a size change never counts in the new one). Only tokens issued since the last key frame of the current session count; others, and repeats, are ignored. A refresh that arrives while the key frame or refresh that serves an earlier one is still being encoded is served by that frame. A non-key frame cannot be told from an ordinary one by its content, and ordinary frames encoded before the refresh was read can still be in flight (they depend on the lost frame): after a `refresh` a Host restarts decoding only at a frame with the key bit or the repair bit set, and drops the frames before it.
++- Prepare step: before its first frame the game builds the prewarm lists' pipelines and, when not done for this game version, the base of every shader pair (`DM_STREAM_PREPARE=0`: in the background while it plays instead). The hello comes first, at the connection; then a `prepare` message when a phase starts, at most 4 a second while it runs, and one with done equal to total when it ends (phase 2 ends when every pair is handed to a worker: a few compiles may still finish behind the game). A phase with nothing to do sends one message, 0 of 0; phase 2 is sent only when this start builds the pairs. No `video` or `audio` comes before the last `prepare`; the first `video` after it is a key frame. A `quit` meanwhile ends the process within 2 s: the pipeline archive keeps every file written so far, and the bases of the flush period under way are built again at the next start. While the game plays, the archive's timed write waits as in a window, until the game has presented no frame for ten seconds and no compile is under way (with `DM_STREAM_PREPARE=0` the background prewarm's own timed writes, every 60 s doubling up to 16 min, still go ahead) ([A timed archive write stalls active presentation](reference/rendering.md#a-timed-archive-write-stalls-active-presentation)).
++- The stream ends (the host exits gracefully) on `quit`, a closed socket, a read or write error, an unknown type, a bad length or a message of the wrong size.
++
+ ## Following main
+ 
+ nxnative has no releases or tags: a front end pins a commit and moves it forward. Between the commit it has (`A`) and the one it moves to (`B`), two things say what changed for it.
+diff --git a/docs/reference/memory.md b/docs/reference/memory.md
+index d613c1f902fd9c8e7511018a2b2f57c00290e0ab..c45d696f55aa7e8fd38d600a47515be404199440 100644
+--- a/docs/reference/memory.md
++++ b/docs/reference/memory.md
+@@ -525,8 +525,8 @@ The guest address space, heaps, pools, virtual address memory and the allocators
+ 
+ - **Symptom:** in a Vulkan or GL game, the memory line's deferred-release queue grows by one entry a frame for the whole session, and each swap chain recreation or window surface of another size keeps its textures (about 24 MB for three 1920x1080 RGBA8 images).
+ - **Cause:** the Vulkan layer's swap chain images and the GL layer's window surface are registered with the present path (`mtl_ext_tex`: a serial, the residency set) with no way back: `vkDestroySwapchainKHR` and `win_make` only dropped their own references. Each present also pinned its texture, and the unpin hands the pin's reference to the deferred-release queue, which only an NVN submission's fence drains; the Vulkan and GL layers submit on queues of their own, so no entry ever left. A console mode switch from the iPhone's in-game menu or a TV connected or disconnected (`dm_set_opmode`) is when a game may recreate its swap chain.
+-- **Fix:** `mtl_ext_tex_release` (`nvn_mtl.m`) is the pair of `mtl_ext_tex`: after the producer has waited for its presents' tickets, it waits for every present queued so far (a submitted present's ticket counts at its completion), takes the serial out of the table without the deferred-release queue (`own_ext_take`), and takes the texture out of the residency set, at once or, while a present is still in flight, when the last one completes. A present of an external texture is not pinned. `vkDestroySwapchainKHR` and `win_make` call it.
+-- **Check:** `make -C dm/gfx/tests GAME=<id> t_vk_swapchain_life && dm/gfx/tests/t_vk_swapchain_life`: 140 swap chains of 3 images, each presented 3 times to an offscreen layer and destroyed, leave none alive (before: 420 of 420, and 420 queue entries).
++- **Fix:** `mtl_ext_tex_release` (`nvn_mtl.m`) is the pair of `mtl_ext_tex`: after the producer has waited for its presents' tickets, it waits for every present queued so far (a submitted present's ticket counts at its completion), takes the serial out of the table without the deferred-release queue (`own_ext_take`), and takes the texture out of the residency set, at once or, while a present is still in flight, when the last one completes. A present of an external texture is not pinned. `vkDestroySwapchainKHR` and `win_make` call it. A streamed present (`DM_STREAM`, `stream_present`) counts the same way: its commit is in flight, and its ticket done, only once its feedback has run (before, its ticket was done at the commit, so an image released meanwhile could leave the residency set while the stream's pass still read it).
++- **Check:** `make -C dm/gfx/tests GAME=<id> t_vk_swapchain_life && dm/gfx/tests/t_vk_swapchain_life`: 140 swap chains of 3 images, each presented 3 times to an offscreen layer and destroyed, leave none alive (before: 420 of 420, and 420 queue entries). `make -C dm/gfx/tests GAME=<id> check_t_stream_present`: with the queue held, a streamed present stays in flight, its ticket not done and a released image resident until the commit completes.
+ - **Found on:** an audit of the presentation path, then reproduced by that test; no game's log measured. Every Vulkan game ([Hades](../../dm/games/0100535012974000/README.md), [Super Mario Galaxy](../../dm/games/010099C022B96000/README.md)) and GL game ([Balatro](../../dm/games/0100CD801CE5E000/README.md)) is on this path.
+ 
+ ### The pool walk's statistics made chunks of a large pool
+diff --git a/docs/reference/rendering.md b/docs/reference/rendering.md
+index 3d749e5554578d54f2e91c69ccb9b74d2a5f04be..565032c9319ba6051650836eff94d69a4dd4b02e 100644
+--- a/docs/reference/rendering.md
++++ b/docs/reference/rendering.md
+@@ -1573,7 +1573,7 @@ The replay on Metal (`dm/gfx/nvn/nvn_mtl.m`) and the Vulkan and OpenGL layers. E
+ 
+ - **Symptom:** the title screen or a menu stops for over a second. The log shows a pipeline archive write and several compiles waiting for it, even when the affected frame did little new pipeline work.
+ - **Cause:** the timer flushes a partial archive after a burst of captures. Metal needs serialization and compilation to run separately, so the write can block a compile that the current frame needs.
+-- **Fix:** the windowed timer leaves captures in the current period until it can take the serialization gate. It retries if a frame was presented in the last ten seconds or a compile is still under way. Once admitted, the timed write starts on the archive queue without waiting for a compile to finish. Full periods still roll over to bound Metal's store. Offline preparation, headless runs and explicit saves use the ordinary flush path.
++- **Fix:** the windowed timer leaves captures in the current period until it can take the serialization gate. It retries if a frame was presented in the last ten seconds or a compile is still under way. Once admitted, the timed write starts on the archive queue without waiting for a compile to finish. Full periods still roll over to bound Metal's store. Offline preparation, headless runs and explicit saves use the ordinary flush path; a streamed game (`DM_STREAM`) has no window but takes the windowed timer, except for a background prewarm's due write ([Streaming front ends](../frontends.md#streaming-front-ends)).
+ - **Check:** `t_pso_archive --active-flush` holds a capture across a timer tick, resumes presentation before the capture finishes, and drives the armed retry until it writes in an idle window. It also covers an outstanding plain compile, explicit saves, full periods and headless timer writes.
+ - **Found on:** [Mario Kart World](../../dm/games/0400C3F00006E000/README.md#startup-and-menu-hitches).
+ 
